@@ -77,6 +77,29 @@ async def analyze_video(file: UploadFile = File(...)):
             return {"detected": True, "detection": best_detection}
         else:
             return {"detected": False}
-
+@app.post("/analyze-frame")
+async def analyze_frame(file: UploadFile = File(...)):
+    contents = await file.read()
+    img_array = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    
+    if frame is None:
+        return {"predictions": []}
+    
+    frame_resized = cv2.resize(frame, (TARGET_SIZE, TARGET_SIZE))
+    _, buffer = cv2.imencode('.jpg', frame_resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    img_base64 = base64.b64encode(buffer).decode('utf-8')
+    
+    response = requests.post(
+        f"https://detect.roboflow.com/{MODEL_ID}",
+        params={"api_key": ROBOFLOW_API_KEY},
+        data=img_base64,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    
+    if response.ok:
+        return response.json()
+    return {"predictions": []}
+    
     finally:
         os.unlink(tmp_path)
