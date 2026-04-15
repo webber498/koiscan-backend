@@ -58,7 +58,9 @@ async def analyze_video(file: UploadFile = File(...)):
                 )
                 
                 if response.ok:
-                    predictions = response.json().get("predictions", [])
+    result = response.json()
+    print(f"Roboflow response: {result}")
+    predictions = result.get("predictions", [])
                     for pred in predictions:
                         if pred["confidence"] > best_confidence:
                             best_confidence = pred["confidence"]
