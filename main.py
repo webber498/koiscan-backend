@@ -77,6 +77,10 @@ async def analyze_video(file: UploadFile = File(...)):
             return {"detected": True, "detection": best_detection}
         else:
             return {"detected": False}
+
+    finally:
+        os.unlink(tmp_path)
+
 @app.post("/analyze-frame")
 async def analyze_frame(file: UploadFile = File(...)):
     contents = await file.read()
@@ -100,6 +104,3 @@ async def analyze_frame(file: UploadFile = File(...)):
     if response.ok:
         return response.json()
     return {"predictions": []}
-    
-    finally:
-        os.unlink(tmp_path)
