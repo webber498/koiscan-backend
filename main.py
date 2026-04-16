@@ -61,7 +61,7 @@ async def analyze_video(file: UploadFile = File(...)):
 
                 if response.ok:
                     result = response.json()
-                    print(f"Frame {frame_count}: status={response.status_code} predictions={len(result.get('predictions', []))}")
+                    print(f"Frame {frame_count}: {len(result.get('predictions', []))} predictions")
                     predictions = result.get("predictions", [])
                     for pred in predictions:
                         if pred["confidence"] > best_confidence:
@@ -89,4 +89,26 @@ async def analyze_video(file: UploadFile = File(...)):
     finally:
         os.unlink(tmp_path)
 
-@app.po
+@app.post("/analyze-frame")
+async def analyze_frame(file: UploadFile = File(...)):
+    contents = await file.read()
+    img_array = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        return {"predictions": []}
+
+    frame_resized = cv2.resize(frame, (TARGET_SIZE, TARGET_SIZE))
+    _, buffer = cv2.imencode('.jpg', frame_resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+    response = requests.post(
+        f"https://detect.roboflow.com/{MODEL_ID}",
+        params={"api_key": ROBOFLOW_API_KEY},
+        data=img_base64,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+
+    if response.ok:
+        return response.json()
+    return {"predictions": []}
