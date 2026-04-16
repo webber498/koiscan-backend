@@ -59,10 +59,10 @@ async def analyze_video(file: UploadFile = File(...)):
                     headers={"Content-Type": "application/x-www-form-urlencoded"}
                 )
 
-                print(f"Frame {frame_count}: status={response.status_code} body={response.text[:200]}")
-
                 if response.ok:
-                    predictions = response.json().get("predictions", [])
+                    result = response.json()
+                    print(f"Frame {frame_count}: status={response.status_code} predictions={len(result.get('predictions', []))}")
+                    predictions = result.get("predictions", [])
                     for pred in predictions:
                         if pred["confidence"] > best_confidence:
                             best_confidence = pred["confidence"]
@@ -70,7 +70,11 @@ async def analyze_video(file: UploadFile = File(...)):
                                 "class": pred["class"],
                                 "confidence": pred["confidence"],
                                 "timestamp": frame_count / fps,
-                                "frame_base64": img_base64
+                                "frame_base64": img_base64,
+                                "x": pred["x"],
+                                "y": pred["y"],
+                                "width": pred["width"],
+                                "height": pred["height"]
                             }
 
             frame_count += 1
@@ -84,3 +88,5 @@ async def analyze_video(file: UploadFile = File(...)):
 
     finally:
         os.unlink(tmp_path)
+
+@app.po
