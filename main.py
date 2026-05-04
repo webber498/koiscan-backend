@@ -18,7 +18,7 @@ app.add_middleware(
 
 ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY")
 MODEL_ID = "koi-parasites-3-gwtia/7"
-FRAME_INTERVAL = 3
+FRAME_INTERVAL = 1
 TARGET_SIZE = 640
 
 @app.get("/")
