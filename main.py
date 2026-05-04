@@ -45,6 +45,7 @@ async def analyze_video(file: UploadFile = File(...)):
         frame_count = 0
         roboflow_attempts = 0
         roboflow_failures = 0
+        auth_error = False
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -87,6 +88,11 @@ async def analyze_video(file: UploadFile = File(...)):
                     else:
                         roboflow_failures += 1
                         print(f"Frame {frame_count}: Roboflow error - status={response.status_code} body={response.text}")
+                        # Fail fast on auth errors — no point trying remaining frames
+                        if response.status_code in [401, 403]:
+                            print("Auth error detected — stopping processing immediately")
+                            auth_error = True
+                            break
 
                 except requests.exceptions.Timeout:
                     roboflow_failures += 1
@@ -99,7 +105,14 @@ async def analyze_video(file: UploadFile = File(...)):
 
         cap.release()
 
-        print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, best_confidence={best_confidence}")
+        print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, auth_error={auth_error}, best_confidence={best_confidence}")
+
+        # Fail fast on auth errors
+        if auth_error:
+            return {
+                "error": "ROBOFLOW_UNAVAILABLE",
+                "message": "Unable to reach the AI model. Please try again later."
+            }
 
         # If all Roboflow calls failed, return a specific error
         if roboflow_attempts > 0 and roboflow_failures == roboflow_attempts:
