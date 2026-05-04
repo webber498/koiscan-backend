@@ -38,6 +38,8 @@ async def analyze_video(file: UploadFile = File(...)):
             fps = 25
         interval = max(1, int(fps * FRAME_INTERVAL))
 
+        print(f"Video opened: fps={fps}, interval={interval}")
+
         best_detection = None
         best_confidence = 0
         frame_count = 0
@@ -52,34 +54,46 @@ async def analyze_video(file: UploadFile = File(...)):
                 _, buffer = cv2.imencode('.jpg', frame_resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 img_base64 = base64.b64encode(buffer).decode('utf-8')
 
-                response = requests.post(
-                    f"https://detect.roboflow.com/{MODEL_ID}",
-                    params={"api_key": ROBOFLOW_API_KEY},
-                    data=img_base64,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"}
-                )
+                try:
+                    response = requests.post(
+                        f"https://detect.roboflow.com/{MODEL_ID}",
+                        params={"api_key": ROBOFLOW_API_KEY},
+                        data=img_base64,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=30
+                    )
 
-                if response.ok:
-                    result = response.json()
-                    print(f"Frame {frame_count}: {len(result.get('predictions', []))} predictions")
-                    predictions = result.get("predictions", [])
-                    for pred in predictions:
-                        if pred["confidence"] > best_confidence:
-                            best_confidence = pred["confidence"]
-                            best_detection = {
-                                "class": pred["class"],
-                                "confidence": pred["confidence"],
-                                "timestamp": frame_count / fps,
-                                "frame_base64": img_base64,
-                                "x": pred["x"],
-                                "y": pred["y"],
-                                "width": pred["width"],
-                                "height": pred["height"]
-                            }
+                    print(f"Frame {frame_count}: status={response.status_code} body={response.text[:300]}")
+
+                    if response.ok:
+                        result = response.json()
+                        predictions = result.get("predictions", [])
+                        for pred in predictions:
+                            if pred["confidence"] > best_confidence:
+                                best_confidence = pred["confidence"]
+                                best_detection = {
+                                    "class": pred["class"],
+                                    "confidence": pred["confidence"],
+                                    "timestamp": frame_count / fps,
+                                    "frame_base64": img_base64,
+                                    "x": pred["x"],
+                                    "y": pred["y"],
+                                    "width": pred["width"],
+                                    "height": pred["height"]
+                                }
+                    else:
+                        print(f"Frame {frame_count}: Roboflow error - status={response.status_code} body={response.text}")
+
+                except requests.exceptions.Timeout:
+                    print(f"Frame {frame_count}: Roboflow request timed out")
+                except requests.exceptions.RequestException as e:
+                    print(f"Frame {frame_count}: Roboflow request failed - {str(e)}")
 
             frame_count += 1
 
         cap.release()
+
+        print(f"Processing complete: {frame_count} frames total, best_confidence={best_confidence}")
 
         if best_detection:
             return {"detected": True, "detection": best_detection}
@@ -106,7 +120,8 @@ async def analyze_frame(file: UploadFile = File(...)):
         f"https://detect.roboflow.com/{MODEL_ID}",
         params={"api_key": ROBOFLOW_API_KEY},
         data=img_base64,
-        headers={"Content-Type": "application/x-www-form-urlencoded"}
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30
     )
 
     if response.ok:
