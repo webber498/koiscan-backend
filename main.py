@@ -137,7 +137,7 @@ async def analyze_frame(file: UploadFile = File(...)):
     img_base64 = base64.b64encode(buffer).decode('utf-8')
 
     response = requests.post(
-        f"https://detect.roboflow.com/{MODEL_ID}",
+        f"https://detect.fakeroboflow.com/{MODEL_ID}",
         params={"api_key": ROBOFLOW_API_KEY},
         data=img_base64,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
