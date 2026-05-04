@@ -43,6 +43,8 @@ async def analyze_video(file: UploadFile = File(...)):
         best_detection = None
         best_confidence = 0
         frame_count = 0
+        roboflow_attempts = 0
+        roboflow_failures = 0
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -55,6 +57,7 @@ async def analyze_video(file: UploadFile = File(...)):
                 img_base64 = base64.b64encode(buffer).decode('utf-8')
 
                 try:
+                    roboflow_attempts += 1
                     response = requests.post(
                         f"https://detect.roboflow.com/{MODEL_ID}",
                         params={"api_key": ROBOFLOW_API_KEY},
@@ -82,18 +85,35 @@ async def analyze_video(file: UploadFile = File(...)):
                                     "height": pred["height"]
                                 }
                     else:
+                        roboflow_failures += 1
                         print(f"Frame {frame_count}: Roboflow error - status={response.status_code} body={response.text}")
 
                 except requests.exceptions.Timeout:
+                    roboflow_failures += 1
                     print(f"Frame {frame_count}: Roboflow request timed out")
                 except requests.exceptions.RequestException as e:
+                    roboflow_failures += 1
                     print(f"Frame {frame_count}: Roboflow request failed - {str(e)}")
 
             frame_count += 1
 
         cap.release()
 
-        print(f"Processing complete: {frame_count} frames total, best_confidence={best_confidence}")
+        print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, best_confidence={best_confidence}")
+
+        # If all Roboflow calls failed, return a specific error
+        if roboflow_attempts > 0 and roboflow_failures == roboflow_attempts:
+            return {
+                "error": "ROBOFLOW_UNAVAILABLE",
+                "message": "Unable to reach the AI model. Please try again later."
+            }
+
+        # If more than 80% of calls failed, still warn even if some succeeded
+        if roboflow_attempts > 0 and roboflow_failures / roboflow_attempts > 0.8 and not best_detection:
+            return {
+                "error": "ROBOFLOW_DEGRADED",
+                "message": "The AI model is experiencing issues. Results may be unreliable."
+            }
 
         if best_detection:
             return {"detected": True, "detection": best_detection}
