@@ -40,8 +40,8 @@ async def analyze_video(file: UploadFile = File(...)):
 
         print(f"Video opened: fps={fps}, interval={interval}")
 
-        best_detection = None
-        best_confidence = 0
+        # Track best detection per parasite class
+        best_per_class = {}
         frame_count = 0
         roboflow_attempts = 0
         roboflow_failures = 0
@@ -73,11 +73,13 @@ async def analyze_video(file: UploadFile = File(...)):
                         result = response.json()
                         predictions = result.get("predictions", [])
                         for pred in predictions:
-                            if pred["confidence"] > best_confidence:
-                                best_confidence = pred["confidence"]
-                                best_detection = {
-                                    "class": pred["class"],
-                                    "confidence": pred["confidence"],
+                            parasite_class = pred["class"]
+                            confidence = pred["confidence"]
+                            # Keep best detection per class
+                            if parasite_class not in best_per_class or confidence > best_per_class[parasite_class]["confidence"]:
+                                best_per_class[parasite_class] = {
+                                    "class": parasite_class,
+                                    "confidence": confidence,
                                     "timestamp": frame_count / fps,
                                     "frame_base64": img_base64,
                                     "x": pred["x"],
@@ -88,7 +90,6 @@ async def analyze_video(file: UploadFile = File(...)):
                     else:
                         roboflow_failures += 1
                         print(f"Frame {frame_count}: Roboflow error - status={response.status_code} body={response.text}")
-                        # Fail fast on auth errors — no point trying remaining frames
                         if response.status_code in [401, 403]:
                             print("Auth error detected — stopping processing immediately")
                             auth_error = True
@@ -105,31 +106,35 @@ async def analyze_video(file: UploadFile = File(...)):
 
         cap.release()
 
-        print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, auth_error={auth_error}, best_confidence={best_confidence}")
+        print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, auth_error={auth_error}, classes_found={list(best_per_class.keys())}")
 
-        # Fail fast on auth errors
         if auth_error:
             return {
                 "error": "ROBOFLOW_UNAVAILABLE",
                 "message": "Unable to reach the AI model. Please try again later."
             }
 
-        # If all Roboflow calls failed, return a specific error
         if roboflow_attempts > 0 and roboflow_failures == roboflow_attempts:
             return {
                 "error": "ROBOFLOW_UNAVAILABLE",
                 "message": "Unable to reach the AI model. Please try again later."
             }
 
-        # If more than 80% of calls failed, still warn even if some succeeded
-        if roboflow_attempts > 0 and roboflow_failures / roboflow_attempts > 0.8 and not best_detection:
+        if roboflow_attempts > 0 and roboflow_failures / roboflow_attempts > 0.8 and not best_per_class:
             return {
                 "error": "ROBOFLOW_DEGRADED",
                 "message": "The AI model is experiencing issues. Results may be unreliable."
             }
 
-        if best_detection:
-            return {"detected": True, "detection": best_detection}
+        if best_per_class:
+            # Sort detections by confidence descending
+            detections = sorted(best_per_class.values(), key=lambda x: x["confidence"], reverse=True)
+            return {
+                "detected": True,
+                "detections": detections,
+                # Keep primary detection for backwards compatibility
+                "detection": detections[0]
+            }
         else:
             return {"detected": False}
 
