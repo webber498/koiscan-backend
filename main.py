@@ -17,9 +17,10 @@ app.add_middleware(
 )
 
 ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY")
-MODEL_ID = "koi-parasites-3-gwtia/7"
+MODEL_ID = "koi-parasites-3-gwtia/8"
 FRAME_INTERVAL = 1
-TARGET_SIZE = 384
+TARGET_SIZE = 576
+CONFIDENCE_THRESHOLD = 37
 
 @app.get("/")
 def health_check():
@@ -38,7 +39,7 @@ async def analyze_video(file: UploadFile = File(...)):
             fps = 25
         interval = max(1, int(fps * FRAME_INTERVAL))
 
-        print(f"Video opened: fps={fps}, interval={interval}")
+        print(f"Video opened: fps={fps}, interval={interval}, model={MODEL_ID}, size={TARGET_SIZE}, conf={CONFIDENCE_THRESHOLD}")
 
         # Track best detection per parasite class
         best_per_class = {}
@@ -61,7 +62,10 @@ async def analyze_video(file: UploadFile = File(...)):
                     roboflow_attempts += 1
                     response = requests.post(
                         f"https://detect.roboflow.com/{MODEL_ID}",
-                        params={"api_key": ROBOFLOW_API_KEY},
+                        params={
+                            "api_key": ROBOFLOW_API_KEY,
+                            "confidence": CONFIDENCE_THRESHOLD
+                        },
                         data=img_base64,
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
                         timeout=30
@@ -156,7 +160,10 @@ async def analyze_frame(file: UploadFile = File(...)):
 
     response = requests.post(
         f"https://detect.roboflow.com/{MODEL_ID}",
-        params={"api_key": ROBOFLOW_API_KEY},
+        params={
+            "api_key": ROBOFLOW_API_KEY,
+            "confidence": CONFIDENCE_THRESHOLD
+        },
         data=img_base64,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30
