@@ -32,12 +32,12 @@ Do NOT try to identify any parasites. Only assess whether this image is usable.
 Answer these three questions:
 1. Is this actually a microscope view of a wet mount sample? (Not a photo of a fish, a pond, a screen showing something else, or an unrelated image.)
 2. Is it in focus enough that small organisms would be distinguishable?
-3. Is this a direct capture, or is it a photograph of a computer/phone screen? Look for moiré patterns, scan lines, screen glare, visible cursors or UI elements.
+3. Is this a direct capture, or is it a photograph of a computer/phone screen? Look for moire patterns, scan lines, screen glare, visible cursors or UI elements.
 
-Respond with ONLY a JSON object, no other text:
+Respond with ONLY a JSON object, no other text and no markdown fences:
 {"is_sample": true/false, "in_focus": true/false, "is_screen_photo": true/false, "note": "one short sentence for the user, or empty string if all is well"}
 
-The note should be plain English addressed to the user, e.g. "This footage looks slightly out of focus, so small parasites may have been missed." Keep it under 20 words. Leave it empty if quality is fine."""
+The note should be plain English addressed to the user, and should never say the video is unusable or ask them to refilm — the analysis has already run and a result is being shown. It is advisory only. For example: "This looks like a recording of a screen rather than a direct capture, which can reduce accuracy." Keep it under 20 words. Leave it as an empty string if quality is fine."""
 
 
 def check_frame_quality(img_base64: str):
@@ -50,27 +50,29 @@ def check_frame_quality(img_base64: str):
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_base64
-                        }
-                    },
-                    {"type": "text", "text": QUALITY_PROMPT}
-                ]
-            }]
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": img_base64
+                            }
+                        },
+                        {"type": "text", "text": QUALITY_PROMPT}
+                    ]
+                },
+                {"role": "assistant", "content": "{"}
+            ]
         )
 
-        raw = message.content[0].text.strip()
+        raw = "{" + message.content[0].text
         print(f"Quality check raw response: {raw[:300]}")
 
-        cleaned = raw.replace("```json", "").replace("```", "").strip()
-        result = json.loads(cleaned)
+        result = json.loads(raw)
 
         return {
             "is_sample": bool(result.get("is_sample", True)),
