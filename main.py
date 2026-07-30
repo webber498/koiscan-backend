@@ -6,6 +6,8 @@ import requests
 import base64
 import tempfile
 import os
+import json
+import anthropic
 
 app = FastAPI()
 
@@ -17,14 +19,75 @@ app.add_middleware(
 )
 
 ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MODEL_ID = "koi-parasites-3-gwtia/9"
 FRAME_INTERVAL = 1
 TARGET_SIZE = 576
 CONFIDENCE_THRESHOLD = 39
 
+QUALITY_PROMPT = """You are checking the quality of a microscope video frame from a koi fish mucus scrape. A hobbyist has filmed this through a microscope eyepiece, usually with a phone.
+
+Do NOT try to identify any parasites. Only assess whether this image is usable.
+
+Answer these three questions:
+1. Is this actually a microscope view of a wet mount sample? (Not a photo of a fish, a pond, a screen showing something else, or an unrelated image.)
+2. Is it in focus enough that small organisms would be distinguishable?
+3. Is this a direct capture, or is it a photograph of a computer/phone screen? Look for moiré patterns, scan lines, screen glare, visible cursors or UI elements.
+
+Respond with ONLY a JSON object, no other text:
+{"is_sample": true/false, "in_focus": true/false, "is_screen_photo": true/false, "note": "one short sentence for the user, or empty string if all is well"}
+
+The note should be plain English addressed to the user, e.g. "This footage looks slightly out of focus, so small parasites may have been missed." Keep it under 20 words. Leave it empty if quality is fine."""
+
+
+def check_frame_quality(img_base64: str):
+    if not ANTHROPIC_API_KEY:
+        print("Quality check skipped: no ANTHROPIC_API_KEY set")
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": img_base64
+                        }
+                    },
+                    {"type": "text", "text": QUALITY_PROMPT}
+                ]
+            }]
+        )
+
+        raw = message.content[0].text.strip()
+        print(f"Quality check raw response: {raw[:300]}")
+
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(cleaned)
+
+        return {
+            "is_sample": bool(result.get("is_sample", True)),
+            "in_focus": bool(result.get("in_focus", True)),
+            "is_screen_photo": bool(result.get("is_screen_photo", False)),
+            "note": str(result.get("note", ""))[:200],
+        }
+
+    except Exception as e:
+        print(f"Quality check failed: {str(e)}")
+        return None
+
+
 @app.get("/")
 def health_check():
     return {"status": "KoiScan backend running"}
+
 
 @app.post("/analyze")
 async def analyze_video(file: UploadFile = File(...)):
@@ -41,8 +104,8 @@ async def analyze_video(file: UploadFile = File(...)):
 
         print(f"Video opened: fps={fps}, interval={interval}, model={MODEL_ID}, size={TARGET_SIZE}, conf={CONFIDENCE_THRESHOLD}")
 
-        # Track best detection per parasite class
         best_per_class = {}
+        sampled_frames = []
         frame_count = 0
         roboflow_attempts = 0
         roboflow_failures = 0
@@ -57,6 +120,7 @@ async def analyze_video(file: UploadFile = File(...)):
                 frame_resized = cv2.resize(frame, (TARGET_SIZE, TARGET_SIZE))
                 _, buffer = cv2.imencode('.jpg', frame_resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 img_base64 = base64.b64encode(buffer).decode('utf-8')
+                sampled_frames.append(img_base64)
 
                 try:
                     roboflow_attempts += 1
@@ -79,7 +143,6 @@ async def analyze_video(file: UploadFile = File(...)):
                         for pred in predictions:
                             parasite_class = pred["class"]
                             confidence = pred["confidence"]
-                            # Keep best detection per class
                             if parasite_class not in best_per_class or confidence > best_per_class[parasite_class]["confidence"]:
                                 best_per_class[parasite_class] = {
                                     "class": parasite_class,
@@ -130,20 +193,32 @@ async def analyze_video(file: UploadFile = File(...)):
                 "message": "The AI model is experiencing issues. Results may be unreliable."
             }
 
-        if best_per_class:
-            # Sort detections by confidence descending
-            detections = sorted(best_per_class.values(), key=lambda x: x["confidence"], reverse=True)
+        detections = sorted(best_per_class.values(), key=lambda x: x["confidence"], reverse=True) if best_per_class else []
+
+        # Quality check: use the best detection frame, or a middle frame if nothing was found
+        quality = None
+        if detections:
+            quality = check_frame_quality(detections[0]["frame_base64"])
+        elif sampled_frames:
+            middle = sampled_frames[len(sampled_frames) // 2]
+            quality = check_frame_quality(middle)
+
+        if quality:
+            print(f"Quality: is_sample={quality['is_sample']} in_focus={quality['in_focus']} screen_photo={quality['is_screen_photo']} note={quality['note']}")
+
+        if detections:
             return {
                 "detected": True,
                 "detections": detections,
-                # Keep primary detection for backwards compatibility
-                "detection": detections[0]
+                "detection": detections[0],
+                "quality": quality
             }
         else:
-            return {"detected": False}
+            return {"detected": False, "quality": quality}
 
     finally:
         os.unlink(tmp_path)
+
 
 @app.post("/analyze-frame")
 async def analyze_frame(file: UploadFile = File(...)):
