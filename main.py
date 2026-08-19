@@ -27,6 +27,8 @@ CONFIDENCE_THRESHOLD = 39
 
 QUALITY_PROMPT = """You are checking the quality of a microscope video frame from a koi fish mucus scrape. A hobbyist has filmed this through a microscope eyepiece, usually with a phone.
 
+A genuine microscope wet-mount frame usually shows: a circular or vignetted field of view from looking through the eyepiece, pale or translucent mucus/tissue with visible texture, debris or organisms at high magnification, and fairly flat, even lighting from the microscope's own light source. This is NOT the same as a photo of open water, a pond, or a fish above the surface — do not assume blue/green or murky colouring alone means it isn't a microscope view; mucus samples often look watery or indistinct even when correctly captured.
+
 Do NOT try to identify any parasites. Only assess whether this image is usable.
 
 Answer these three questions:
