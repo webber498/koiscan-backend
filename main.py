@@ -164,12 +164,14 @@ def check_no_detection_commentary(frames: list):
         )
 
         raw = "{" + message.content[0].text
-        print(f"No-detection commentary raw response: {raw[:300]}")
+        print(f"No-detection commentary raw response: {raw}")
         result = json.loads(raw)
 
+        # max_tokens=300 is a *token* budget (~4 chars/token), so this is a
+        # generous backstop, not the routine limit — it should rarely bind.
         return {
             "organism_visible": bool(result.get("organism_visible", False)),
-            "commentary": str(result.get("commentary", ""))[:300],
+            "commentary": str(result.get("commentary", ""))[:600],
         }
 
     except Exception as e:
