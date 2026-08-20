@@ -42,6 +42,82 @@ Respond with ONLY a JSON object, no other text and no markdown fences:
 The note should be plain English addressed to the user, and should never say the video is unusable or ask them to refilm — the analysis has already run and a result is being shown. It is advisory only. For example: "This looks like a recording of a screen rather than a direct capture, which can reduce accuracy." Keep it under 20 words. Leave it as an empty string if quality is fine."""
 
 
+SAME_ORGANISM_INSTRUCTIONS = """These two images are cropped from the same koi mucus-scrape microscope video, showing two separate detections an object-detection model made at different moments in the video.
+
+Do these two crops plausibly show the SAME physical organism, just captured in a different pose, angle, or with motion blur — or do they look like genuinely different organisms?
+
+Respond with ONLY a JSON object, no other text and no markdown fences:
+{"same_organism": true/false, "reasoning": "one short sentence explaining your judgement"}"""
+
+
+def crop_detection(img_base64: str, det: dict, padding_factor: float = 0.6):
+    """Crop the region around a detection (x/y are the box centre) with some
+    padding for context, so a comparison model has a focused, uncluttered view."""
+    img_bytes = base64.b64decode(img_base64)
+    img_array = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    cx, cy = det["x"], det["y"]
+    pad_w = det["width"] * (1 + padding_factor)
+    pad_h = det["height"] * (1 + padding_factor)
+    x1 = max(0, int(cx - pad_w / 2))
+    y1 = max(0, int(cy - pad_h / 2))
+    x2 = min(w, int(cx + pad_w / 2))
+    y2 = min(h, int(cy + pad_h / 2))
+
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    _, buffer = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return base64.b64encode(buffer).decode('utf-8')
+
+
+def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confidence: float,
+                         other_crop_b64: str, other_class: str, other_confidence: float):
+    """PROTOTYPE: ask Claude whether a secondary detection is plausibly the
+    same organism as the primary one, misread as a different class. Never
+    used to remove a detection — only to flag it for the user."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f'Image 1: detected as "{primary_class}" at {round(primary_confidence * 100)}% confidence.'},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": primary_crop_b64}},
+                        {"type": "text", "text": f'Image 2: detected as "{other_class}" at {round(other_confidence * 100)}% confidence.'},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": other_crop_b64}},
+                        {"type": "text", "text": SAME_ORGANISM_INSTRUCTIONS},
+                    ],
+                },
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+
+        raw = "{" + message.content[0].text
+        print(f"Same-organism check raw response: {raw[:300]}")
+        result = json.loads(raw)
+
+        return {
+            "same_organism": bool(result.get("same_organism", False)),
+            "reasoning": str(result.get("reasoning", ""))[:200],
+        }
+
+    except Exception as e:
+        print(f"Same-organism check failed: {str(e)}")
+        return None
+
+
 def check_frame_quality(img_base64: str):
     if not ANTHROPIC_API_KEY:
         print("Quality check skipped: no ANTHROPIC_API_KEY set")
@@ -198,6 +274,25 @@ async def analyze_video(file: UploadFile = File(...)):
             }
 
         detections = sorted(best_per_class.values(), key=lambda x: x["confidence"], reverse=True) if best_per_class else []
+
+        # PROTOTYPE: for each secondary detection, ask Claude whether it's
+        # plausibly the same organism as the primary one, misread as a
+        # different class (e.g. yesterday's Skin Fluke/White Spot mixup).
+        # Flags the detection for the frontend to caveat — never removes it.
+        if len(detections) > 1:
+            primary_crop = crop_detection(detections[0]["frame_base64"], detections[0])
+            if primary_crop:
+                for det in detections[1:]:
+                    other_crop = crop_detection(det["frame_base64"], det)
+                    if not other_crop:
+                        continue
+                    comparison = check_same_organism(
+                        primary_crop, detections[0]["class"], detections[0]["confidence"],
+                        other_crop, det["class"], det["confidence"],
+                    )
+                    if comparison:
+                        det["same_organism_as_primary"] = comparison["same_organism"]
+                        det["same_organism_reasoning"] = comparison["reasoning"]
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
