@@ -118,6 +118,65 @@ def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confi
         return None
 
 
+NO_DETECTION_COMMENTARY_PROMPT = """You are looking at frames from a koi mucus-scrape microscope video. A specialist model already screened this video for a specific list of koi parasites (Costia, Chilodonella, Gill Flukes, Skin Fluke, White Spot, and others) and found none of them.
+
+Look across these frames for anything that looks like a distinct living organism, even if you don't recognise the exact species. Common harmless things people mistake for parasites include rotifers, ciliates, and other free-living microorganisms, or bits of plant/algae/debris — none of these are koi parasites.
+
+If you can see something worth mentioning, describe it in general, appropriately hedged terms — never claim a confident species identification, and never claim certainty that it's harmless just because it isn't on the parasite list. If nothing distinct and identifiable is visible, or you're not confident enough to say anything useful, leave the commentary empty.
+
+This is shown to a koi hobbyist purely as educational context, not a diagnosis or reassurance — the parasite screen already ran and found nothing; this is only about what else, if anything, is visible.
+
+Respond with ONLY a JSON object, no other text and no markdown fences:
+{"organism_visible": true/false, "commentary": "one or two short plain-English sentences addressed to the user, or empty string"}"""
+
+MAX_COMMENTARY_FRAMES = 12
+
+
+def select_representative_frames(frames: list, max_count: int = MAX_COMMENTARY_FRAMES) -> list:
+    """Evenly subsample so long videos don't send dozens of frames to Claude in one call."""
+    if len(frames) <= max_count:
+        return frames
+    step = len(frames) / max_count
+    return [frames[int(i * step)] for i in range(max_count)]
+
+
+def check_no_detection_commentary(frames: list):
+    """When the parasite model found nothing, ask Claude to describe anything
+    else visible in general terms. Never a diagnosis, never used to identify
+    a parasite — only shown alongside a genuine no-detection result."""
+    if not ANTHROPIC_API_KEY or not frames:
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        content = []
+        for f in frames:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": f}})
+        content.append({"type": "text", "text": NO_DETECTION_COMMENTARY_PROMPT})
+
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+
+        raw = "{" + message.content[0].text
+        print(f"No-detection commentary raw response: {raw[:300]}")
+        result = json.loads(raw)
+
+        return {
+            "organism_visible": bool(result.get("organism_visible", False)),
+            "commentary": str(result.get("commentary", ""))[:300],
+        }
+
+    except Exception as e:
+        print(f"No-detection commentary failed: {str(e)}")
+        return None
+
+
 def check_frame_quality(img_base64: str):
     if not ANTHROPIC_API_KEY:
         print("Quality check skipped: no ANTHROPIC_API_KEY set")
@@ -296,14 +355,19 @@ async def analyze_video(file: UploadFile = File(...)):
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
+        commentary = None
         if detections:
             quality = check_frame_quality(detections[0]["frame_base64"])
         elif sampled_frames:
             middle = sampled_frames[len(sampled_frames) // 2]
             quality = check_frame_quality(middle)
+            commentary = check_no_detection_commentary(select_representative_frames(sampled_frames))
 
         if quality:
             print(f"Quality: is_sample={quality['is_sample']} in_focus={quality['in_focus']} screen_photo={quality['is_screen_photo']} note={quality['note']}")
+
+        if commentary:
+            print(f"Commentary: organism_visible={commentary['organism_visible']} text={commentary['commentary']}")
 
         if detections:
             return {
@@ -313,7 +377,7 @@ async def analyze_video(file: UploadFile = File(...)):
                 "quality": quality
             }
         else:
-            return {"detected": False, "quality": quality}
+            return {"detected": False, "quality": quality, "commentary": commentary}
 
     finally:
         os.unlink(tmp_path)
