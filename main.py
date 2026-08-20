@@ -50,6 +50,14 @@ Respond with ONLY a JSON object, no other text and no markdown fences:
 {"same_organism": true/false, "reasoning": "one short sentence explaining your judgement"}"""
 
 
+LABEL_PLAUSIBILITY_INSTRUCTIONS = """This is a cropped image from a koi mucus-scrape microscope video. An object-detection model has labelled what's in this crop as a specific koi parasite (named in the message above).
+
+Look closely at the actual visible detail inside the organism, not just its outline shape. Does the internal structure genuinely look consistent with that parasite, or does it look more like something else — for example a free-living ciliate/protozoan (like a Paramecium), debris, or an artefact? An elongated or fluke-like outline alone is not enough to confirm a fluke-type parasite; internal detail matters more than silhouette.
+
+Respond with ONLY a JSON object, no other text and no markdown fences:
+{"label_plausible": true/false, "reasoning": "one short sentence explaining your judgement, focused on what you actually see"}"""
+
+
 def crop_detection(img_base64: str, det: dict, padding_factor: float = 0.6):
     """Crop the region around a detection (x/y are the box centre) with some
     padding for context, so a comparison model has a focused, uncluttered view."""
@@ -115,6 +123,47 @@ def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confi
 
     except Exception as e:
         print(f"Same-organism check failed: {str(e)}")
+        return None
+
+
+def check_label_plausibility(crop_b64: str, claimed_class: str, confidence: float):
+    """PROTOTYPE: sanity-check the primary detection's claimed class against
+    what's actually visible (internal detail, not just outline shape) — e.g.
+    a Paramecium being misread as Gill Flukes off silhouette alone. Only
+    ever flags the detection for the frontend to caveat, never removes or
+    downgrades it."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f'This crop was labelled "{claimed_class}" at {round(confidence * 100)}% confidence by the parasite-detection model.'},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": crop_b64}},
+                        {"type": "text", "text": LABEL_PLAUSIBILITY_INSTRUCTIONS},
+                    ],
+                },
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+
+        raw = "{" + message.content[0].text
+        print(f"Label plausibility raw response: {raw}")
+        result = json.loads(raw)
+
+        return {
+            "label_plausible": bool(result.get("label_plausible", True)),
+            "reasoning": str(result.get("reasoning", ""))[:400],
+        }
+
+    except Exception as e:
+        print(f"Label plausibility check failed: {str(e)}")
         return None
 
 
@@ -336,19 +385,30 @@ async def analyze_video(file: UploadFile = File(...)):
 
         detections = sorted(best_per_class.values(), key=lambda x: x["confidence"], reverse=True) if best_per_class else []
 
-        # PROTOTYPE: for each secondary detection, ask Claude whether it's
-        # plausibly the same organism as the primary one, misread as a
-        # different class (e.g. yesterday's Skin Fluke/White Spot mixup).
-        # Flags the detection for the frontend to caveat — never removes it.
-        if len(detections) > 1:
-            primary_crop = crop_detection(detections[0]["frame_base64"], detections[0])
+        # PROTOTYPE: two Claude-vision sanity checks on the raw Roboflow
+        # detections. Both only ever add a flag for the frontend to show as
+        # a caveat — neither removes or downgrades a detection.
+        if detections:
+            primary = detections[0]
+            primary_crop = crop_detection(primary["frame_base64"], primary)
+
             if primary_crop:
+                # 1. Does the claimed class match the visible internal detail,
+                # or did the model likely key on outline shape alone? (e.g.
+                # the Gill Flukes/Paramecium mixup this was built for.)
+                plausibility = check_label_plausibility(primary_crop, primary["class"], primary["confidence"])
+                if plausibility:
+                    primary["label_plausible"] = plausibility["label_plausible"]
+                    primary["label_plausibility_reasoning"] = plausibility["reasoning"]
+
+                # 2. For any secondary detections, is this plausibly the same
+                # organism as the primary, misread as a different class?
                 for det in detections[1:]:
                     other_crop = crop_detection(det["frame_base64"], det)
                     if not other_crop:
                         continue
                     comparison = check_same_organism(
-                        primary_crop, detections[0]["class"], detections[0]["confidence"],
+                        primary_crop, primary["class"], primary["confidence"],
                         other_crop, det["class"], det["confidence"],
                     )
                     if comparison:
