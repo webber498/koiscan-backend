@@ -20,7 +20,7 @@ app.add_middleware(
 
 ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-MODEL_ID = "koi-parasites-3-gwtia-11-rfdetr-large-t2"
+MODEL_ID = "adams-workspace-vwxcv/koi-parasites-3-gwtia-11-rfdetr-large-t2"
 FRAME_INTERVAL = 1
 TARGET_SIZE = 1024
 CONFIDENCE_THRESHOLD = 39
