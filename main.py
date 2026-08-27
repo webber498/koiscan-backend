@@ -7,6 +7,7 @@ import base64
 import tempfile
 import os
 import json
+import re
 import anthropic
 
 app = FastAPI()
@@ -104,6 +105,11 @@ def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confi
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # Note: unlike the Haiku calls elsewhere in this file, claude-sonnet-5
+        # rejects an assistant-turn prefill ("This model does not support
+        # assistant message prefill") — the conversation must end on a user
+        # message, so the JSON has to be parsed out of a normal free-text
+        # reply instead of forced to start with "{".
         message = client.messages.create(
             model="claude-sonnet-5",
             max_tokens=200,
@@ -118,13 +124,15 @@ def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confi
                         {"type": "text", "text": SAME_ORGANISM_INSTRUCTIONS},
                     ],
                 },
-                {"role": "assistant", "content": "{"},
             ],
         )
 
-        raw = "{" + message.content[0].text
-        print(f"Same-organism check raw response: {raw[:300]}")
-        result = json.loads(raw)
+        text_block = next((block.text for block in message.content if block.type == "text"), "")
+        print(f"Same-organism check raw response: {text_block[:300]}")
+        match = re.search(r'\{.*\}', text_block, re.DOTALL)
+        if not match:
+            raise ValueError(f"No JSON object found in response: {text_block[:200]}")
+        result = json.loads(match.group(0))
 
         return {
             "same_organism": bool(result.get("same_organism", False)),
