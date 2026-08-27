@@ -44,7 +44,9 @@ The note should be plain English addressed to the user, and should never say the
 
 SAME_ORGANISM_INSTRUCTIONS = """These two images are cropped from the same koi mucus-scrape microscope video, showing two separate detections an object-detection model made at different moments in the video.
 
-Do these two crops plausibly show the SAME physical organism, just captured in a different pose, angle, or with motion blur — or do they look like genuinely different organisms?
+The object-detection model is known to sometimes mislabel the SAME organism as two different parasite classes when it's seen again later — pose, angle, lighting, focus, and how much of the body is in frame can all look quite different between two sightings of one real organism, especially if there's a time gap between them. Weigh persistent structural cues (overall body shape and proportions, relative size, distinctive features like a fin/sucker/segment pattern) much more heavily than incidental differences in pose, lighting, or exact framing — those alone are NOT evidence of a different organism.
+
+Do these two crops plausibly show the SAME physical organism, seen twice — or do they look like genuinely different organisms? If you're genuinely unsure after weighing the above, prefer "same_organism": true — this only adds an advisory note for the user to double-check, it never removes or changes either detection, so a false "same" costs far less than a false "different" (which would wrongly tell the user two separate parasites are present).
 
 Respond with ONLY a JSON object, no other text and no markdown fences:
 {"same_organism": true/false, "reasoning": "one short sentence explaining your judgement"}"""
@@ -85,17 +87,23 @@ def crop_detection(img_base64: str, det: dict, padding_factor: float = 0.6):
 
 
 def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confidence: float,
-                         other_crop_b64: str, other_class: str, other_confidence: float):
+                         other_crop_b64: str, other_class: str, other_confidence: float,
+                         primary_timestamp: float = None, other_timestamp: float = None):
     """PROTOTYPE: ask Claude whether a secondary detection is plausibly the
     same organism as the primary one, misread as a different class. Never
     used to remove a detection — only to flag it for the user."""
     if not ANTHROPIC_API_KEY:
         return None
 
+    gap_note = ""
+    if primary_timestamp is not None and other_timestamp is not None:
+        gap = abs(other_timestamp - primary_timestamp)
+        gap_note = f' They were detected {gap:.1f} seconds apart in the video.'
+
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-5",
             max_tokens=200,
             messages=[
                 {
@@ -103,7 +111,7 @@ def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confi
                     "content": [
                         {"type": "text", "text": f'Image 1: detected as "{primary_class}" at {round(primary_confidence * 100)}% confidence.'},
                         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": primary_crop_b64}},
-                        {"type": "text", "text": f'Image 2: detected as "{other_class}" at {round(other_confidence * 100)}% confidence.'},
+                        {"type": "text", "text": f'Image 2: detected as "{other_class}" at {round(other_confidence * 100)}% confidence.{gap_note}'},
                         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": other_crop_b64}},
                         {"type": "text", "text": SAME_ORGANISM_INSTRUCTIONS},
                     ],
@@ -410,6 +418,8 @@ async def analyze_video(file: UploadFile = File(...)):
                     comparison = check_same_organism(
                         primary_crop, primary["class"], primary["confidence"],
                         other_crop, det["class"], det["confidence"],
+                        primary_timestamp=primary.get("timestamp"),
+                        other_timestamp=det.get("timestamp"),
                     )
                     if comparison:
                         det["same_organism_as_primary"] = comparison["same_organism"]
