@@ -46,7 +46,7 @@ SAME_ORGANISM_INSTRUCTIONS = """These two images are cropped from the same koi m
 
 The object-detection model is known to sometimes mislabel the SAME organism as two different parasite classes when it's seen again later — pose, angle, lighting, focus, and how much of the body is in frame can all look quite different between two sightings of one real organism, especially if there's a time gap between them. Weigh persistent structural cues (overall body shape and proportions, relative size, distinctive features like a fin/sucker/segment pattern) much more heavily than incidental differences in pose, lighting, or exact framing — those alone are NOT evidence of a different organism.
 
-Do these two crops plausibly show the SAME physical organism, seen twice — or do they look like genuinely different organisms? If you're genuinely unsure after weighing the above, prefer "same_organism": true — this only adds an advisory note for the user to double-check, it never removes or changes either detection, so a false "same" costs far less than a false "different" (which would wrongly tell the user two separate parasites are present).
+Do these two crops plausibly show the SAME physical organism, seen twice — or do they look like genuinely different organisms? If you're genuinely unsure after weighing the above, prefer "same_organism": true — image 2 is hidden from the user whenever you answer true, so a false "same" only costs a rare genuine second finding going unshown, while a false "different" would wrongly tell the user two separate parasites are present and undermine trust in the whole result.
 
 Respond with ONLY a JSON object, no other text and no markdown fences:
 {"same_organism": true/false, "reasoning": "one short sentence explaining your judgement"}"""
@@ -90,8 +90,10 @@ def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confi
                          other_crop_b64: str, other_class: str, other_confidence: float,
                          primary_timestamp: float = None, other_timestamp: float = None):
     """PROTOTYPE: ask Claude whether a secondary detection is plausibly the
-    same organism as the primary one, misread as a different class. Never
-    used to remove a detection — only to flag it for the user."""
+    same organism as the primary one, misread as a different class. Flagged
+    detections are hidden entirely on the frontend (a mislabelled repeat
+    undermines trust in the whole result more than a rare hidden second
+    finding costs) — this never affects the primary detection itself."""
     if not ANTHROPIC_API_KEY:
         return None
 
@@ -394,8 +396,10 @@ async def analyze_video(file: UploadFile = File(...)):
         detections = sorted(best_per_class.values(), key=lambda x: x["confidence"], reverse=True) if best_per_class else []
 
         # PROTOTYPE: two Claude-vision sanity checks on the raw Roboflow
-        # detections. Both only ever add a flag for the frontend to show as
-        # a caveat — neither removes or downgrades a detection.
+        # detections. Label-plausibility only ever adds a flag for the
+        # frontend to show as a caveat on the primary detection. The
+        # same-organism check's flag causes the frontend to hide that
+        # secondary detection entirely — see check_same_organism's docstring.
         if detections:
             primary = detections[0]
             primary_crop = crop_detection(primary["frame_base64"], primary)
