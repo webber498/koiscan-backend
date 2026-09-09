@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 import requests
@@ -25,6 +26,11 @@ MODEL_ID = "adams-workspace-vwxcv/koi-parasites-3-gwtia-11-rfdetr-large-t2"
 FRAME_INTERVAL = 1
 TARGET_SIZE = 1024
 CONFIDENCE_THRESHOLD = 39
+# Roboflow calls are the dominant cost of a scan (one HTTP round-trip per
+# sampled frame, ~1/sec of video) - running a bounded batch concurrently
+# instead of one-at-a-time cuts wall-clock wait time roughly in proportion
+# to this number, without changing which frames get analysed or how.
+MAX_CONCURRENT_ROBOFLOW_CALLS = 6
 
 QUALITY_PROMPT = """You are checking the quality of a microscope video frame from a koi fish mucus scrape. A hobbyist has filmed this through a microscope eyepiece, usually with a phone.
 
@@ -292,6 +298,29 @@ def check_frame_quality(img_base64: str):
         return None
 
 
+def _call_roboflow(frame_count: int, img_base64: str):
+    """Runs in a worker thread - one Roboflow inference call for one sampled
+    frame. Returns (frame_count, img_base64, response_or_None, error_or_None)
+    so the caller can process results as they complete, same as the old
+    inline per-frame handling did."""
+    try:
+        response = requests.post(
+            f"https://detect.roboflow.com/{MODEL_ID}",
+            params={
+                "api_key": ROBOFLOW_API_KEY,
+                "confidence": CONFIDENCE_THRESHOLD
+            },
+            data=img_base64,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30
+        )
+        return frame_count, img_base64, response, None
+    except requests.exceptions.Timeout:
+        return frame_count, img_base64, None, "timed out"
+    except requests.exceptions.RequestException as e:
+        return frame_count, img_base64, None, str(e)
+
+
 @app.get("/")
 def health_check():
     return {"status": "KoiScan backend running"}
@@ -312,74 +341,72 @@ async def analyze_video(file: UploadFile = File(...)):
 
         print(f"Video opened: fps={fps}, interval={interval}, model={MODEL_ID}, size={TARGET_SIZE}, conf={CONFIDENCE_THRESHOLD}")
 
-        best_per_class = {}
-        sampled_frames = []
+        # Pass 1: read and encode every sampled frame. Cheap, local, entirely
+        # sequential (video decoding doesn't benefit from parallelizing and
+        # frame order matters for interval sampling) - the expensive part is
+        # the network round-trip to Roboflow, handled in pass 2 below.
+        sampled = []
         frame_count = 0
-        roboflow_attempts = 0
-        roboflow_failures = 0
-        auth_error = False
-
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-
             if frame_count % interval == 0:
                 frame_resized = cv2.resize(frame, (TARGET_SIZE, TARGET_SIZE))
                 _, buffer = cv2.imencode('.jpg', frame_resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 img_base64 = base64.b64encode(buffer).decode('utf-8')
-                sampled_frames.append(img_base64)
-
-                try:
-                    roboflow_attempts += 1
-                    response = requests.post(
-                        f"https://detect.roboflow.com/{MODEL_ID}",
-                        params={
-                            "api_key": ROBOFLOW_API_KEY,
-                            "confidence": CONFIDENCE_THRESHOLD
-                        },
-                        data=img_base64,
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        timeout=30
-                    )
-
-                    print(f"Frame {frame_count}: status={response.status_code} body={response.text[:300]}")
-
-                    if response.ok:
-                        result = response.json()
-                        predictions = result.get("predictions", [])
-                        for pred in predictions:
-                            parasite_class = pred["class"]
-                            confidence = pred["confidence"]
-                            if parasite_class not in best_per_class or confidence > best_per_class[parasite_class]["confidence"]:
-                                best_per_class[parasite_class] = {
-                                    "class": parasite_class,
-                                    "confidence": confidence,
-                                    "timestamp": frame_count / fps,
-                                    "frame_base64": img_base64,
-                                    "x": pred["x"],
-                                    "y": pred["y"],
-                                    "width": pred["width"],
-                                    "height": pred["height"]
-                                }
-                    else:
-                        roboflow_failures += 1
-                        print(f"Frame {frame_count}: Roboflow error - status={response.status_code} body={response.text}")
-                        if response.status_code in [401, 403]:
-                            print("Auth error detected — stopping processing immediately")
-                            auth_error = True
-                            break
-
-                except requests.exceptions.Timeout:
-                    roboflow_failures += 1
-                    print(f"Frame {frame_count}: Roboflow request timed out")
-                except requests.exceptions.RequestException as e:
-                    roboflow_failures += 1
-                    print(f"Frame {frame_count}: Roboflow request failed - {str(e)}")
-
+                sampled.append((frame_count, img_base64))
             frame_count += 1
-
         cap.release()
+
+        sampled_frames = [b64 for _, b64 in sampled]  # kept for the no-detection-commentary path below
+
+        # Pass 2: the Roboflow calls themselves, run concurrently (bounded)
+        # instead of one-at-a-time - this is the actual latency win. Note:
+        # unlike the old sequential version, an auth error no longer stops
+        # in-flight/queued calls early (all sampled frames' requests are
+        # already dispatched by the time the first response comes back) -
+        # a real but small cost (a handful of fast-failing calls) traded for
+        # the parallelism win on the common, non-error path.
+        best_per_class = {}
+        roboflow_attempts = len(sampled)
+        roboflow_failures = 0
+        auth_error = False
+
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_ROBOFLOW_CALLS) as executor:
+            futures = [executor.submit(_call_roboflow, fc, b64) for fc, b64 in sampled]
+            for future in as_completed(futures):
+                frame_count_i, img_base64_i, response, error = future.result()
+
+                if error is not None:
+                    roboflow_failures += 1
+                    print(f"Frame {frame_count_i}: Roboflow request failed - {error}")
+                    continue
+
+                print(f"Frame {frame_count_i}: status={response.status_code} body={response.text[:300]}")
+
+                if response.ok:
+                    result = response.json()
+                    predictions = result.get("predictions", [])
+                    for pred in predictions:
+                        parasite_class = pred["class"]
+                        confidence = pred["confidence"]
+                        if parasite_class not in best_per_class or confidence > best_per_class[parasite_class]["confidence"]:
+                            best_per_class[parasite_class] = {
+                                "class": parasite_class,
+                                "confidence": confidence,
+                                "timestamp": frame_count_i / fps,
+                                "frame_base64": img_base64_i,
+                                "x": pred["x"],
+                                "y": pred["y"],
+                                "width": pred["width"],
+                                "height": pred["height"]
+                            }
+                else:
+                    roboflow_failures += 1
+                    print(f"Frame {frame_count_i}: Roboflow error - status={response.status_code} body={response.text}")
+                    if response.status_code in [401, 403]:
+                        auth_error = True
 
         print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, auth_error={auth_error}, classes_found={list(best_per_class.keys())}")
 
