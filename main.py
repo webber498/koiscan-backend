@@ -480,6 +480,18 @@ async def analyze_video(file: UploadFile = File(...)):
                 if not cand_crop:
                     chosen = cand  # can't check this one - fail open, stop here
                     break
+                # Diagnostic logging added 2026-10-12: a gill fluke video gave
+                # two different label-plausibility verdicts on back-to-back
+                # identical-looking runs. Adam's hypothesis: concurrent
+                # per-frame Roboflow calls can let a DIFFERENT near-tied-
+                # confidence frame win the "representative frame for this
+                # class" slot between runs (network-completion-order
+                # dependent, not random model flakiness) - if the organism's
+                # shape/pose genuinely differs between those frames (e.g. a
+                # gill fluke mid-stretch vs. fully compressed), two honestly
+                # different verdicts on two different images is expected, not
+                # a bug. This line makes that provable instead of inferred.
+                print(f"Checking label plausibility for {cand['class']} at frame timestamp {cand['timestamp']:.2f}s (confidence {cand['confidence']:.2f})")
                 plausibility = check_label_plausibility(cand_crop, cand["class"], cand["confidence"])
                 if plausibility is None:
                     chosen = cand  # check itself failed (e.g. no API key) - fail open
