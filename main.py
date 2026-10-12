@@ -25,7 +25,12 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MODEL_ID = "adams-workspace-vwxcv/koi-parasites-3-gwtia-11-rfdetr-large-t2"
 FRAME_INTERVAL = 1
 TARGET_SIZE = 1024
-CONFIDENCE_THRESHOLD = 39
+# 2026-10-12: lowered from 39 to 30 per Roboflow's own sweep after the v11
+# retrain - their data showed 30 is this model's actual best-F1 point,
+# trading a bit of precision (55.1% -> 49.8%) for meaningfully more recall
+# (40.4% -> 44.4%). Was left at the old value pending this decision -
+# Adam approved the move once the two detection-accuracy fixes above landed.
+CONFIDENCE_THRESHOLD = 30
 # Roboflow calls are the dominant cost of a scan (one HTTP round-trip per
 # sampled frame, ~1/sec of video) - running a bounded batch concurrently
 # instead of one-at-a-time cuts wall-clock wait time roughly in proportion
@@ -456,25 +461,47 @@ async def analyze_video(file: UploadFile = File(...)):
             reverse=True,
         ) if best_per_class else []
 
-        # PROTOTYPE: two Claude-vision sanity checks on the raw Roboflow
-        # detections. Label-plausibility only ever adds a flag for the
-        # frontend to show as a caveat on the primary detection. The
-        # same-organism check's flag causes the frontend to hide that
-        # secondary detection entirely — see check_same_organism's docstring.
+        # PROTOTYPE, upgraded 2026-10-12: label-plausibility used to only
+        # ever add a flag for the frontend to caveat the primary with - it
+        # never changed what was actually shown. Per Adam's explicit product
+        # call the same session ("focus on making sure the primary result is
+        # correct", and separately: don't show users a hedge, just be right)
+        # it now gets a real say: try candidates in the backend's own ranked
+        # order (frame-frequency first), and promote the first one that
+        # actually passes this visual check instead of blindly trusting
+        # whichever ranked first. Falls back to the original top choice if
+        # NONE of them pass (better to show something than nothing) - still
+        # flagged with label_plausible=False so that's visible in the data
+        # even though the UI doesn't currently surface it.
         if detections:
+            chosen = None
+            for cand in detections:
+                cand_crop = crop_detection(cand["frame_base64"], cand)
+                if not cand_crop:
+                    chosen = cand  # can't check this one - fail open, stop here
+                    break
+                plausibility = check_label_plausibility(cand_crop, cand["class"], cand["confidence"])
+                if plausibility is None:
+                    chosen = cand  # check itself failed (e.g. no API key) - fail open
+                    break
+                cand["label_plausible"] = plausibility["label_plausible"]
+                cand["label_plausibility_reasoning"] = plausibility["reasoning"]
+                if plausibility["label_plausible"]:
+                    chosen = cand
+                    break
+            if chosen is None:
+                chosen = detections[0]  # none of them passed - fall back to the original top
+
+            if chosen is not detections[0]:
+                print(f"Primary promoted from {detections[0]['class']} to {chosen['class']} after it failed the label-plausibility check")
+                detections.remove(chosen)
+                detections.insert(0, chosen)
+
             primary = detections[0]
             primary_crop = crop_detection(primary["frame_base64"], primary)
 
             if primary_crop:
-                # 1. Does the claimed class match the visible internal detail,
-                # or did the model likely key on outline shape alone? (e.g.
-                # the Gill Flukes/Paramecium mixup this was built for.)
-                plausibility = check_label_plausibility(primary_crop, primary["class"], primary["confidence"])
-                if plausibility:
-                    primary["label_plausible"] = plausibility["label_plausible"]
-                    primary["label_plausibility_reasoning"] = plausibility["reasoning"]
-
-                # 2. For any secondary detections, is this plausibly the same
+                # For any secondary detections, is this plausibly the same
                 # organism as the primary, misread as a different class?
                 for det in detections[1:]:
                     other_crop = crop_detection(det["frame_base64"], det)
