@@ -369,6 +369,20 @@ async def analyze_video(file: UploadFile = File(...)):
         # a real but small cost (a handful of fast-failing calls) traded for
         # the parallelism win on the common, non-error path.
         best_per_class = {}
+        # How many distinct sampled frames each class showed up in at all,
+        # not just its single best-confidence frame. A one-off high-
+        # confidence misread on a single frame (e.g. a blurry Chilodonella
+        # read as Trichodina) shouldn't out-rank a class the model saw
+        # consistently across many independent frames - frequency across
+        # frames is a more robust signal than any one frame's confidence,
+        # since each frame is an independent look at (presumably) the same
+        # organism. Real bug this fixes, confirmed via Railway logs 2026-10-12:
+        # a video the owner confirmed was "obviously Chilodonella" showed
+        # BOTH "Chilodonella" and "Trichodina" across its sampled frames,
+        # and the app picked Trichodina purely because one single frame
+        # happened to score a higher confidence than Chilodonella's best
+        # frame - with no regard for which class actually showed up more.
+        class_frame_counts = {}
         roboflow_attempts = len(sampled)
         roboflow_failures = 0
         auth_error = False
@@ -391,6 +405,7 @@ async def analyze_video(file: UploadFile = File(...)):
                     for pred in predictions:
                         parasite_class = pred["class"]
                         confidence = pred["confidence"]
+                        class_frame_counts[parasite_class] = class_frame_counts.get(parasite_class, 0) + 1
                         if parasite_class not in best_per_class or confidence > best_per_class[parasite_class]["confidence"]:
                             best_per_class[parasite_class] = {
                                 "class": parasite_class,
@@ -408,7 +423,10 @@ async def analyze_video(file: UploadFile = File(...)):
                     if response.status_code in [401, 403]:
                         auth_error = True
 
-        print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, auth_error={auth_error}, classes_found={list(best_per_class.keys())}")
+        for parasite_class, det in best_per_class.items():
+            det["frame_count"] = class_frame_counts.get(parasite_class, 0)
+
+        print(f"Processing complete: {frame_count} frames total, {roboflow_attempts} roboflow calls, {roboflow_failures} failures, auth_error={auth_error}, classes_found={list(best_per_class.keys())}, frame_counts={class_frame_counts}")
 
         if auth_error:
             return {
@@ -428,7 +446,15 @@ async def analyze_video(file: UploadFile = File(...)):
                 "message": "The AI model is experiencing issues. Results may be unreliable."
             }
 
-        detections = sorted(best_per_class.values(), key=lambda x: x["confidence"], reverse=True) if best_per_class else []
+        # Sort by frame_count first (how many independent sampled frames
+        # agreed on this class), confidence only as a tiebreaker - see the
+        # note above class_frame_counts for why frequency beats a single
+        # frame's confidence.
+        detections = sorted(
+            best_per_class.values(),
+            key=lambda x: (x.get("frame_count", 0), x["confidence"]),
+            reverse=True,
+        ) if best_per_class else []
 
         # PROTOTYPE: two Claude-vision sanity checks on the raw Roboflow
         # detections. Label-plausibility only ever adds a flag for the
