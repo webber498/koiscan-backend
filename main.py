@@ -64,9 +64,11 @@ Respond with ONLY a JSON object, no other text and no markdown fences:
 {"same_organism": true/false, "reasoning": "one short sentence explaining your judgement"}"""
 
 
-LABEL_PLAUSIBILITY_INSTRUCTIONS = """This is a cropped image from a koi mucus-scrape microscope video. An object-detection model has labelled what's in this crop as a specific koi parasite (named in the message above).
+LABEL_PLAUSIBILITY_INSTRUCTIONS = """These are cropped image(s) from a koi mucus-scrape microscope video, all of the same candidate organism at different moments in the video if more than one is shown. An object-detection model has labelled what's in them as a specific koi parasite (named in the message above).
 
 Look closely at the actual visible detail inside the organism, not just its outline shape. Does the internal structure genuinely look consistent with that parasite, or does it look more like something else — for example a free-living ciliate/protozoan (like a Paramecium), debris, or an artefact? An elongated or fluke-like outline alone is not enough to confirm a fluke-type parasite; internal detail matters more than silhouette.
+
+If multiple images are shown, also weigh how the organism's shape changes between them - visible stretching and compressing over time is consistent with a real fluke-type parasite's natural movement, not evidence against it, even if any single frame alone looks rounder or more ambiguous.
 
 Respond with ONLY a JSON object, no other text and no markdown fences:
 {"label_plausible": true/false, "reasoning": "one short sentence explaining your judgement, focused on what you actually see"}"""
@@ -96,6 +98,26 @@ def crop_detection(img_base64: str, det: dict, padding_factor: float = 0.6):
 
     _, buffer = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return base64.b64encode(buffer).decode('utf-8')
+
+
+def select_diverse_frames(frames, max_frames=3):
+    """Picks up to max_frames entries spread across the CHRONOLOGICAL order
+    of 'frames' (sorted by timestamp), rather than just the highest-
+    confidence ones - several high-confidence frames of the same candidate
+    often cluster around the same pose (e.g. an organism sitting still for
+    a couple of seconds), which wouldn't actually give the label-
+    plausibility check any new information. Spreading across time instead
+    gives it a genuinely different look at the candidate each time - built
+    for a real case (2026-10-12) where a gill fluke's visible stretching/
+    compressing was the actual tell, but a single frame could look
+    ambiguously round."""
+    frames_sorted = sorted(frames, key=lambda f: f["timestamp"])
+    if len(frames_sorted) <= max_frames:
+        return frames_sorted
+    if max_frames <= 1:
+        return frames_sorted[:1]
+    idxs = sorted({round(i * (len(frames_sorted) - 1) / (max_frames - 1)) for i in range(max_frames)})
+    return [frames_sorted[i] for i in idxs]
 
 
 def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confidence: float,
@@ -155,29 +177,49 @@ def check_same_organism(primary_crop_b64: str, primary_class: str, primary_confi
         return None
 
 
-def check_label_plausibility(crop_b64: str, claimed_class: str, confidence: float):
-    """PROTOTYPE: sanity-check the primary detection's claimed class against
-    what's actually visible (internal detail, not just outline shape) — e.g.
-    a Paramecium being misread as Gill Flukes off silhouette alone. Only
-    ever flags the detection for the frontend to caveat, never removes or
-    downgrades it."""
+def check_label_plausibility(crop_b64_list, claimed_class: str, confidence: float, timestamps=None):
+    """PROTOTYPE, upgraded 2026-10-12 to accept MULTIPLE crops of the same
+    candidate (up to 3, picked by select_diverse_frames to spread across
+    the video's timeline, not just the highest-confidence frames which
+    tend to cluster around the same pose). Built after a real case: a gill
+    fluke that visibly stretches and compresses was misjudged against a
+    single compressed-looking frame, and the same video gave a different
+    verdict on a re-run because a different near-tied-confidence frame won
+    the "representative" slot - showing the model several moments at once
+    (closer to what a human watching the whole video sees) is a more
+    direct fix than hoping one lucky frame gets picked. Sanity-checks the
+    claimed class against what's actually visible (internal detail, not
+    just outline shape) — e.g. a Paramecium being misread as Gill Flukes
+    off silhouette alone. Only ever flags the detection for the frontend
+    to caveat, never removes or downgrades it on its own (the caller
+    decides what to do with the result)."""
     if not ANTHROPIC_API_KEY:
+        return None
+    if not crop_b64_list:
         return None
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        n = len(crop_b64_list)
+        intro = (
+            f'This candidate was labelled "{claimed_class}" at {round(confidence * 100)}% confidence '
+            f'by the parasite-detection model. Below {"is" if n == 1 else "are"} {n} crop{"s" if n != 1 else ""} '
+            f'of the same candidate{" from different moments in the video" if n > 1 else ""}.'
+        )
+        content = [{"type": "text", "text": intro}]
+        for i, crop_b64 in enumerate(crop_b64_list):
+            label = f"Image {i + 1}"
+            if timestamps and i < len(timestamps):
+                label += f" (at {timestamps[i]:.1f}s)"
+            content.append({"type": "text", "text": f"{label}:"})
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": crop_b64}})
+        content.append({"type": "text", "text": LABEL_PLAUSIBILITY_INSTRUCTIONS})
+
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=200,
             messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f'This crop was labelled "{claimed_class}" at {round(confidence * 100)}% confidence by the parasite-detection model.'},
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": crop_b64}},
-                        {"type": "text", "text": LABEL_PLAUSIBILITY_INSTRUCTIONS},
-                    ],
-                },
+                {"role": "user", "content": content},
                 {"role": "assistant", "content": "{"},
             ],
         )
@@ -388,6 +430,11 @@ async def analyze_video(file: UploadFile = File(...)):
         # happened to score a higher confidence than Chilodonella's best
         # frame - with no regard for which class actually showed up more.
         class_frame_counts = {}
+        # Every detection (not just the best one) per class, so the
+        # label-plausibility check can be given several genuinely different
+        # moments of the same candidate later, not just whichever single
+        # frame happened to score highest - see select_diverse_frames.
+        class_all_frames = {}
         roboflow_attempts = len(sampled)
         roboflow_failures = 0
         auth_error = False
@@ -411,17 +458,19 @@ async def analyze_video(file: UploadFile = File(...)):
                         parasite_class = pred["class"]
                         confidence = pred["confidence"]
                         class_frame_counts[parasite_class] = class_frame_counts.get(parasite_class, 0) + 1
+                        entry = {
+                            "class": parasite_class,
+                            "confidence": confidence,
+                            "timestamp": frame_count_i / fps,
+                            "frame_base64": img_base64_i,
+                            "x": pred["x"],
+                            "y": pred["y"],
+                            "width": pred["width"],
+                            "height": pred["height"]
+                        }
+                        class_all_frames.setdefault(parasite_class, []).append(entry)
                         if parasite_class not in best_per_class or confidence > best_per_class[parasite_class]["confidence"]:
-                            best_per_class[parasite_class] = {
-                                "class": parasite_class,
-                                "confidence": confidence,
-                                "timestamp": frame_count_i / fps,
-                                "frame_base64": img_base64_i,
-                                "x": pred["x"],
-                                "y": pred["y"],
-                                "width": pred["width"],
-                                "height": pred["height"]
-                            }
+                            best_per_class[parasite_class] = entry
                 else:
                     roboflow_failures += 1
                     print(f"Frame {frame_count_i}: Roboflow error - status={response.status_code} body={response.text}")
@@ -476,23 +525,38 @@ async def analyze_video(file: UploadFile = File(...)):
         if detections:
             chosen = None
             for cand in detections:
-                cand_crop = crop_detection(cand["frame_base64"], cand)
-                if not cand_crop:
+                # Upgraded 2026-10-12: give the check several genuinely
+                # different moments of this candidate (spread across time,
+                # not just highest-confidence frames which tend to cluster
+                # around the same pose) instead of just one frame - a gill
+                # fluke that visibly stretches/compresses was misjudged
+                # against a single compressed-looking frame before this.
+                # class_all_frames.get(...) falls back to [cand] itself for
+                # the Costia motion-detection path, which was never added to
+                # class_all_frames (it doesn't come from the per-frame
+                # Roboflow loop at all).
+                diverse_frames = select_diverse_frames(class_all_frames.get(cand["class"], [cand]))
+                crops, crop_timestamps = [], []
+                for f in diverse_frames:
+                    c = crop_detection(f["frame_base64"], f)
+                    if c:
+                        crops.append(c)
+                        crop_timestamps.append(f["timestamp"])
+                if not crops:
                     chosen = cand  # can't check this one - fail open, stop here
                     break
                 # Diagnostic logging added 2026-10-12: a gill fluke video gave
                 # two different label-plausibility verdicts on back-to-back
-                # identical-looking runs. Adam's hypothesis: concurrent
-                # per-frame Roboflow calls can let a DIFFERENT near-tied-
-                # confidence frame win the "representative frame for this
-                # class" slot between runs (network-completion-order
-                # dependent, not random model flakiness) - if the organism's
-                # shape/pose genuinely differs between those frames (e.g. a
-                # gill fluke mid-stretch vs. fully compressed), two honestly
-                # different verdicts on two different images is expected, not
-                # a bug. This line makes that provable instead of inferred.
-                print(f"Checking label plausibility for {cand['class']} at frame timestamp {cand['timestamp']:.2f}s (confidence {cand['confidence']:.2f})")
-                plausibility = check_label_plausibility(cand_crop, cand["class"], cand["confidence"])
+                # identical-looking runs, most likely because a different
+                # near-tied-confidence frame won the "representative frame"
+                # slot between runs (network-completion-order dependent, not
+                # random model flakiness) - if the organism's shape/pose
+                # genuinely differs between those frames, two honestly
+                # different verdicts on two different images is expected,
+                # not a bug. This line makes that provable instead of
+                # inferred, and now also shows every timestamp actually used.
+                print(f"Checking label plausibility for {cand['class']} using {len(crops)} frame(s) at timestamps {[round(t, 2) for t in crop_timestamps]}s")
+                plausibility = check_label_plausibility(crops, cand["class"], cand["confidence"], timestamps=crop_timestamps)
                 if plausibility is None:
                     chosen = cand  # check itself failed (e.g. no API key) - fail open
                     break
