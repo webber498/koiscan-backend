@@ -861,16 +861,22 @@ async def analyze_video(file: UploadFile = File(...)):
             # check (nothing to visually confirm against). The shape/group check
             # above can't help here either - all 3 candidates were in the SAME
             # movement group, so it never even ran. This checks something
-            # different: does the primary actually TRANSLATE across the screen at
-            # all? A real organism should (Trichodina spins with some drift,
-            # Chilodonella glides further, per Adam's own description) - a static
-            # air bubble or debris shouldn't move meaningfully. Only runs when
-            # every candidate already failed its own visual check (a clean signal
-            # something's off) and the shape/group check above didn't already act,
-            # and only promotes when there's exactly one specific alternative
-            # candidate to compare against - same "don't invent a guess between
-            # multiple options" discipline as the check above.
-            if all_candidates_rejected and not shape_check_applied and len(detections) == 2:
+            # different: does each candidate actually TRANSLATE across the screen
+            # at all? A real organism should (Trichodina spins largely in place
+            # with some drift, Chilodonella glides further, per Adam) - a static
+            # air bubble or debris shouldn't move meaningfully.
+            #
+            # Unlike the shape/group signal (which genuinely can't tell two
+            # same-group species apart, so it refuses to guess between several
+            # candidates), movement CAN discriminate within the group - so this
+            # checks EVERY candidate's own movement, not just one specific
+            # alternative. Only runs when every candidate already failed its own
+            # visual check (a clean signal something's off) and the shape/group
+            # check above didn't already act, and only promotes when EXACTLY ONE
+            # candidate clearly stands out as actually moving while the current
+            # primary doesn't - if none do, or more than one does, there's still
+            # nothing to confidently choose between.
+            if all_candidates_rejected and not shape_check_applied:
                 try:
                     primary_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, primary)
                 except Exception as e:
@@ -879,24 +885,28 @@ async def analyze_video(file: UploadFile = File(...)):
                 if primary_movement:
                     print(f"Movement-check for primary={primary['class']}: {primary_movement}")
                     if shows_no_real_movement(primary_movement):
-                        alt_cand = detections[1]
-                        try:
-                            alt_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, alt_cand)
-                        except Exception as e:
-                            alt_movement = None
-                            print(f"Movement-corroboration check failed for alternative (non-fatal): {e}")
-                        if alt_movement:
-                            print(f"Movement-check for alternative={alt_cand['class']}: {alt_movement}")
-                            if shows_clear_real_movement(alt_movement):
-                                reasoning = (
-                                    f"Movement tracking found {primary['class']} essentially static "
-                                    f"(path_length={primary_movement['path_length_bl']} body-lengths) while "
-                                    f"{alt_cand['class']} showed clear real movement "
-                                    f"(path_length={alt_movement['path_length_bl']} body-lengths) - more "
-                                    f"consistent with {alt_cand['class']} being the actual living organism, "
-                                    f"especially since every candidate here failed its own visual check."
-                                )
-                                primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_movement)
+                        moving_cands = []
+                        for cand in detections[1:]:
+                            try:
+                                cand_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, cand)
+                            except Exception as e:
+                                cand_movement = None
+                                print(f"Movement-corroboration check failed for {cand['class']} (non-fatal): {e}")
+                            if cand_movement:
+                                print(f"Movement-check for {cand['class']}: {cand_movement}")
+                                if shows_clear_real_movement(cand_movement):
+                                    moving_cands.append((cand, cand_movement))
+                        if len(moving_cands) == 1:
+                            alt_cand, alt_movement = moving_cands[0]
+                            reasoning = (
+                                f"Movement tracking found {primary['class']} essentially static "
+                                f"(path_length={primary_movement['path_length_bl']} body-lengths) while "
+                                f"{alt_cand['class']} showed clear real movement "
+                                f"(path_length={alt_movement['path_length_bl']} body-lengths) - more "
+                                f"consistent with {alt_cand['class']} being the actual living organism, "
+                                f"especially since every candidate here failed its own visual check."
+                            )
+                            primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_movement)
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
