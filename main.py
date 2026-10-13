@@ -11,6 +11,9 @@ import json
 import re
 import anthropic
 
+from motion_costia import find_costia_detection
+from motion_shape_check import check_shape_group, STATIC_GROUP, MOBILE_GROUP
+
 app = FastAPI()
 
 app.add_middleware(
@@ -74,6 +77,16 @@ Respond with ONLY a JSON object, no other text and no markdown fences:
 {"label_plausible": true/false, "reasoning": "one short sentence explaining your judgement, focused on what you actually see"}"""
 
 
+COSTIA_CANDIDATE_INSTRUCTIONS = """This is a cropped region from a koi mucus-scrape microscope video. A motion-tracking algorithm flagged real movement matching Costia's signature SPECIFICALLY inside the small red-outlined box drawn on this image — not anywhere else in the crop, which is shown only for surrounding context (a comparison point for "is the boxed area actually different from the texture around it"). Costia is tiny (~7-10 microns) and identified almost entirely by erratic darting movement, not distinctive static appearance — at this magnification it typically looks like an indistinct pale blob, not a parasite with visible internal organs.
+
+Look ONLY at the content INSIDE the red box. Ignore anything elsewhere in the image, even if it looks like a real organism — that is not what triggered this candidate, and judging it instead is a real failure mode seen before (wider context accidentally pulled in an unrelated organism visible elsewhere in frame).
+
+Because Costia cannot be confirmed from a still image, do not try to identify the species. Just judge: is there a real, single bounded shape inside the red box, distinguishable from the surrounding granular texture — or is the area inside the red box just background texture, debris, or (another real failure mode seen before) text/caption content?
+
+Respond with ONLY a JSON object, no other text and no markdown fences:
+{"plausible_organism": true/false, "reasoning": "one short sentence, referencing specifically what is inside the red box"}"""
+
+
 def crop_detection(img_base64: str, det: dict, padding_factor: float = 0.6):
     """Crop the region around a detection (x/y are the box centre) with some
     padding for context, so a comparison model has a focused, uncluttered view."""
@@ -95,6 +108,45 @@ def crop_detection(img_base64: str, det: dict, padding_factor: float = 0.6):
     crop = img[y1:y2, x1:x2]
     if crop.size == 0:
         return None
+
+    _, buffer = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return base64.b64encode(buffer).decode('utf-8')
+
+
+def crop_and_mark_detection(img_base64: str, det: dict, padding_factor: float = 4.0):
+    """Like crop_detection, but with much wider padding AND the exact
+    detection box drawn on the crop in red — built for the Costia motion-
+    candidate plausibility check, where a plain tight crop turned out to be
+    too small/low-context to reliably judge (confirmed directly: Claude
+    couldn't tell "generic background texture" from "a real tiny organism"
+    in an unmarked ~70px crop), but a wider unmarked crop caused a
+    different failure — it sometimes judged an unrelated organism visible
+    elsewhere in the wider context instead of the actual candidate spot.
+    Marking the exact box lets Claude use the wider context as a comparison
+    point while still judging the right specific location."""
+    img_bytes = base64.b64decode(img_base64)
+    img_array = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    cx, cy = det["x"], det["y"]
+    pad_w = det["width"] * (1 + padding_factor)
+    pad_h = det["height"] * (1 + padding_factor)
+    x1 = max(0, int(cx - pad_w / 2))
+    y1 = max(0, int(cy - pad_h / 2))
+    x2 = min(w, int(cx + pad_w / 2))
+    y2 = min(h, int(cy + pad_h / 2))
+
+    crop = img[y1:y2, x1:x2].copy()
+    if crop.size == 0:
+        return None
+
+    bw, bh = det["width"], det["height"]
+    bx1, by1 = int(cx - bw / 2) - x1, int(cy - bh / 2) - y1
+    bx2, by2 = int(cx + bw / 2) - x1, int(cy + bh / 2) - y1
+    cv2.rectangle(crop, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
 
     _, buffer = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return base64.b64encode(buffer).decode('utf-8')
@@ -235,6 +287,53 @@ def check_label_plausibility(crop_b64_list, claimed_class: str, confidence: floa
 
     except Exception as e:
         print(f"Label plausibility check failed: {str(e)}")
+        return None
+
+
+def check_costia_candidate_plausible(crop_b64: str):
+    """Gate for the Costia motion-detection path — deliberately NOT the same
+    check as check_label_plausibility above. That check asks "does the
+    visible internal detail match this specific claimed species" which is
+    the wrong question for Costia: it has no distinctive static appearance
+    to confirm, that's the whole reason it needs movement tracking instead
+    of a still-frame classifier. Tested directly: reusing
+    check_label_plausibility here rejected 100% of candidates, including
+    the exact video previously confirmed as genuine Costia by a human. This
+    check only rules out the clearly-not-an-organism cases (on-screen text,
+    a ruler, empty background, an artifact) that the motion candidate-finder
+    has no way to distinguish from real movement on its own — confirmed
+    directly to fire on on-screen caption text on an unrelated video."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": crop_b64}},
+                        {"type": "text", "text": COSTIA_CANDIDATE_INSTRUCTIONS},
+                    ],
+                },
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+
+        raw = "{" + message.content[0].text
+        print(f"Costia candidate plausibility raw response: {raw}")
+        result = json.loads(raw)
+
+        return {
+            "plausible_organism": bool(result.get("plausible_organism", True)),
+            "reasoning": str(result.get("reasoning", ""))[:400],
+        }
+
+    except Exception as e:
+        print(f"Costia candidate plausibility check failed: {str(e)}")
         return None
 
 
@@ -500,6 +599,45 @@ async def analyze_video(file: UploadFile = File(...)):
                 "message": "The AI model is experiencing issues. Results may be unreliable."
             }
 
+        # Motion-detection fallback for Costia: a single still frame can't
+        # capture the erratic-darting-movement signal that identifies it, so
+        # Roboflow has near-zero recall here no matter how well trained -
+        # see motion_costia.py's docstring for the full history. Only runs
+        # when Roboflow found NOTHING at all (not merely "didn't find
+        # Costia specifically") - this path is genuinely expensive (motion
+        # analysis + tracking + a Claude call per candidate tried, tested at
+        # up to ~100s on a video with no real Costia in it), so a scan that
+        # already has a clear, confident detection of another species
+        # shouldn't also pay this cost just to check for Costia too.
+        if not best_per_class:
+            def _costia_plausibility_check(det):
+                # The motion candidate-finder always returns its best-ranked
+                # guess within THIS video, even when nothing organism-like is
+                # really there (confirmed directly: it tracked on-screen
+                # caption text on an unrelated video) - gate on a check
+                # purpose-built for Costia (see check_costia_candidate_plausible's
+                # docstring for why check_label_plausibility isn't the right
+                # tool here - tested directly, it rejected 100% of candidates
+                # including previously-confirmed-genuine ones).
+                crop = crop_and_mark_detection(det["frame_base64"], det)
+                if not crop:
+                    return True  # couldn't crop - fail open, don't block on a local bug
+                result = check_costia_candidate_plausible(crop)
+                if result is None:
+                    return True  # check itself failed - fail open, same as the other Claude checks
+                return result["plausible_organism"]
+
+            try:
+                costia_detection = find_costia_detection(
+                    tmp_path, fps, TARGET_SIZE, plausibility_checker=_costia_plausibility_check
+                )
+                if costia_detection:
+                    print(f"Motion detection found a Costia candidate at {costia_detection['timestamp']:.1f}s")
+                    costia_detection["frame_count"] = 1
+                    best_per_class["Costia"] = costia_detection
+            except Exception as e:
+                print(f"Costia motion detection failed (non-fatal): {e}")
+
         # Sort by frame_count first (how many independent sampled frames
         # agreed on this class), confidence only as a tiebreaker - see the
         # note above class_frame_counts for why frequency beats a single
@@ -592,6 +730,28 @@ async def analyze_video(file: UploadFile = File(...)):
                     if comparison:
                         det["same_organism_as_primary"] = comparison["same_organism"]
                         det["same_organism_reasoning"] = comparison["reasoning"]
+
+            # PROTOTYPE, Phase 2 (2026-10-13): shape-corroboration check, computed
+            # and LOGGED ONLY - must not affect detections or what's returned to
+            # the user (see motion_shape_check.py's docstring for the full
+            # reasoning and the two real misclassifications this is built
+            # against). Deliberately narrow trigger: only runs when the primary
+            # and some OTHER detected candidate actually disagree on which of
+            # the two movement groups they're in - this is a direct match for
+            # both real bugs found today, and keeps the cost of this expensive,
+            # still-unproven check off every ordinary scan.
+            other_classes = {d["class"] for d in detections[1:]}
+            cross_group_ambiguity = (
+                (primary["class"] in STATIC_GROUP and other_classes & MOBILE_GROUP) or
+                (primary["class"] in MOBILE_GROUP and other_classes & STATIC_GROUP)
+            )
+            if cross_group_ambiguity:
+                try:
+                    shape_stats = check_shape_group(tmp_path, fps, TARGET_SIZE, primary)
+                    if shape_stats:
+                        print(f"Shape-check (log-only) for primary={primary['class']} vs. secondaries={other_classes}: {shape_stats}")
+                except Exception as e:
+                    print(f"Shape-corroboration check failed (non-fatal): {e}")
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
