@@ -198,3 +198,32 @@ def shape_signal_supports_mobile(stats):
         and stats["n_reseeds"] == 0
         and stats["aspect_ratio_range"] >= SHAPE_PROMOTE_MOBILE_THRESHOLD
     )
+
+
+# Phase 3 extension (2026-10-13): the reverse direction - demoting a
+# MOBILE_GROUP primary in favor of a STATIC_GROUP secondary - needs an extra
+# safeguard the "promote to mobile" direction didn't. The one known
+# resting-fluke reading (0.014) scores LOWER than every genuinely static
+# reading seen so far (0.037, 0.046, 0.106, 0.106), so a low reading alone
+# can't safely confirm a mobile-group primary is actually wrong - there's no
+# threshold that cleanly separates "really static" from "a fluke resting for
+# this particular 10s window." Real resting flukes don't change their
+# internal anatomy just because they're holding still, though, so requiring
+# the existing label-plausibility check to have ALSO independently rejected
+# this primary (see this threshold's only use site in main.py) closes that
+# gap - a real resting fluke should still pass that check even on a quiet
+# video, so requiring both signals to agree filters out the risk a shape
+# reading alone can't.
+SHAPE_DEMOTE_STATIC_THRESHOLD = 0.15
+
+
+def shape_signal_supports_static(stats):
+    """Mirrors shape_signal_supports_mobile for the opposite direction. NOT
+    sufficient on its own to demote a primary - see SHAPE_DEMOTE_STATIC_THRESHOLD's
+    docstring for the required second signal (the primary's own
+    label-plausibility verdict) that makes using this safe."""
+    return (
+        stats is not None
+        and stats["n_reseeds"] == 0
+        and stats["aspect_ratio_range"] <= SHAPE_DEMOTE_STATIC_THRESHOLD
+    )

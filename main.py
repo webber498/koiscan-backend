@@ -13,7 +13,7 @@ import anthropic
 
 from motion_costia import find_costia_detection
 from motion_shape_check import (
-    check_shape_group, shape_signal_supports_mobile,
+    check_shape_group, shape_signal_supports_mobile, shape_signal_supports_static,
     STATIC_GROUP, MOBILE_GROUP, SHAPE_PROMOTED_FIXED_CONFIDENCE,
 )
 
@@ -470,6 +470,39 @@ def _call_roboflow(frame_count: int, img_base64: str):
         return frame_count, img_base64, None, str(e)
 
 
+def _apply_shape_promotion(detections, old_primary, new_primary, reasoning, shape_stats):
+    """Shared mechanics for letting the shape-corroboration signal swap which
+    detection is primary, used by both directions (promoting a mobile
+    secondary, or demoting a mobile primary back down to a static one). Does
+    three things that are easy to get wrong individually (confirmed directly
+    - the first version of this only did the reorder, which looked like a
+    completely different, confusingly-contradictory result to the end user):
+    shows a fixed, honest confidence instead of old_primary's/new_primary's
+    own possibly-low-or-misleading raw Roboflow score, carries the
+    same-organism-duplicate flag over to whichever one ends up demoted (that
+    check only ever marks the ORIGINAL secondary, so without this the
+    demoted detection wrongly reappears as a separate result), and reorders
+    detections in place."""
+    new_primary["shape_promoted"] = True
+    new_primary["roboflow_confidence"] = new_primary["confidence"]
+    new_primary["confidence"] = SHAPE_PROMOTED_FIXED_CONFIDENCE
+    new_primary["shape_promotion_reasoning"] = reasoning
+    # The same-organism check ran earlier with old_primary as primary, so any
+    # "same organism" verdict for this pair is sitting on new_primary (it was
+    # the "other" detection at check time) - move it onto old_primary, which
+    # is the one now demoted to secondary. Without this the frontend's
+    # duplicate-secondary filter (which only ever checks a SECONDARY's own
+    # flag) has no idea the demoted detection is a duplicate of the new
+    # primary, and shows it as a separate, confusingly different result -
+    # confirmed directly as a real bug testing this today.
+    old_primary["same_organism_as_primary"] = new_primary.pop("same_organism_as_primary", None)
+    old_primary["same_organism_reasoning"] = new_primary.pop("same_organism_reasoning", None)
+    print(f"Primary changed from {old_primary['class']} to {new_primary['class']} based on the shape-corroboration signal ({shape_stats})")
+    detections.remove(new_primary)
+    detections.insert(0, new_primary)
+    return new_primary
+
+
 @app.get("/")
 def health_check():
     return {"status": "KoiScan backend running"}
@@ -743,15 +776,20 @@ async def analyze_video(file: UploadFile = File(...)):
             # candidates), while this shape signal correctly read strongly
             # "mobile" for the same video (aspect_ratio_range=4.861,
             # n_reseeds=0) - see motion_shape_check.py's docstring for the
-            # full validation history behind the threshold used here.
+            # full validation history behind the thresholds used here.
             #
-            # Deliberately ONE-DIRECTIONAL: only ever promotes a MOBILE_GROUP
-            # secondary over a STATIC_GROUP primary, never the reverse. A
-            # resting mobile fluke was measured reading as low as 0.014 during
-            # validation - lower than any static-group reading seen - so a LOW
-            # reading can never safely be used to confirm a static primary is
-            # correct. There's no real-world case yet needing that direction,
-            # only evidence for this one.
+            # Two directions, deliberately NOT symmetric. Promoting a mobile
+            # secondary over a static primary just needs a strongly-mobile
+            # reading. The reverse - demoting a mobile primary down to a
+            # static secondary - ALSO requires the mobile primary to have
+            # already failed its own label-plausibility check: a resting
+            # mobile fluke was measured reading as low as 0.014 (lower than
+            # any static-group reading seen), so a low reading alone can't
+            # safely confirm a mobile primary is wrong - but a real fluke's
+            # internal anatomy doesn't change just because it's holding
+            # still, so requiring the independent visual check to ALSO have
+            # rejected it closes that gap (see motion_shape_check.py's
+            # SHAPE_DEMOTE_STATIC_THRESHOLD docstring for the full reasoning).
             #
             # Trigger stays narrow on purpose: only runs this expensive,
             # still-fairly-new check when the primary and some OTHER detected
@@ -773,36 +811,22 @@ async def analyze_video(file: UploadFile = File(...)):
                     if primary["class"] in STATIC_GROUP and shape_signal_supports_mobile(shape_stats):
                         mobile_cand = next((d for d in detections[1:] if d["class"] in MOBILE_GROUP), None)
                         if mobile_cand:
-                            old_primary = primary
-                            mobile_cand["shape_promoted"] = True
-                            # Keep the raw Roboflow score around for logs/debugging, but
-                            # show a fixed, honest Medium-tier number instead of it (see
-                            # SHAPE_PROMOTED_FIXED_CONFIDENCE's docstring for why) - the
-                            # real per-frame score here can be low precisely because the
-                            # organism looked ambiguous on that frame, which looked wrong
-                            # sitting next to the demoted candidate's higher score.
-                            mobile_cand["roboflow_confidence"] = mobile_cand["confidence"]
-                            mobile_cand["confidence"] = SHAPE_PROMOTED_FIXED_CONFIDENCE
-                            mobile_cand["shape_promotion_reasoning"] = (
+                            reasoning = (
                                 f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
                                 f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
                                 f"organism, not the static reading expected for {primary['class']}."
                             )
-                            # The same-organism check above ran with the OLD primary, and
-                            # "are these the same organism" doesn't depend on which one is
-                            # labelled primary - carry that verdict over to whichever one is
-                            # now demoted. Without this, the frontend's duplicate-secondary
-                            # filter (which only ever checks a SECONDARY's own flag) has no
-                            # idea the demoted detection is a duplicate of the new primary,
-                            # and shows it as a separate, confusingly higher-confidence
-                            # "Also Found" result - confirmed directly as a real bug testing
-                            # this today.
-                            old_primary["same_organism_as_primary"] = mobile_cand.pop("same_organism_as_primary", None)
-                            old_primary["same_organism_reasoning"] = mobile_cand.pop("same_organism_reasoning", None)
-                            print(f"Primary promoted from {primary['class']} to {mobile_cand['class']} based on the shape-corroboration signal ({shape_stats})")
-                            detections.remove(mobile_cand)
-                            detections.insert(0, mobile_cand)
-                            primary = mobile_cand
+                            primary = _apply_shape_promotion(detections, primary, mobile_cand, reasoning, shape_stats)
+                    elif (primary["class"] in MOBILE_GROUP and primary.get("label_plausible") is False
+                          and shape_signal_supports_static(shape_stats)):
+                        static_cand = next((d for d in detections[1:] if d["class"] in STATIC_GROUP), None)
+                        if static_cand:
+                            reasoning = (
+                                f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
+                                f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a static/round "
+                                f"organism, and {primary['class']} already failed its own label-plausibility check."
+                            )
+                            primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
