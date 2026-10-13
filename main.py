@@ -808,25 +808,39 @@ async def analyze_video(file: UploadFile = File(...)):
                     print(f"Shape-corroboration check failed (non-fatal): {e}")
                 if shape_stats:
                     print(f"Shape-check for primary={primary['class']} vs. secondaries={other_classes}: {shape_stats}")
-                    if primary["class"] in STATIC_GROUP and shape_signal_supports_mobile(shape_stats):
-                        mobile_cand = next((d for d in detections[1:] if d["class"] in MOBILE_GROUP), None)
-                        if mobile_cand:
-                            reasoning = (
-                                f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
-                                f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
-                                f"organism, not the static reading expected for {primary['class']}."
-                            )
-                            primary = _apply_shape_promotion(detections, primary, mobile_cand, reasoning, shape_stats)
+                    # The shape signal only discriminates "static vs. mobile" at the
+                    # group level - it can't tell Trichodina from Chilodonella, or Gill
+                    # Flukes from Skin Fluke, apart. Found testing today: when BOTH
+                    # static species showed up as secondaries on one video, this used to
+                    # just grab whichever one Roboflow happened to rank higher
+                    # (Trichodina over Chilodonella, 2 frames vs. 1) with no actual
+                    # evidence favoring it - a specific-looking guess with nothing behind
+                    # it. Only act when exactly ONE class from the target group is
+                    # present among the secondaries - real evidence narrows it to one
+                    # candidate; two or more means the group split alone can't resolve
+                    # which species it is, and inventing an answer anyway would be worse
+                    # than leaving the (known-uncertain) original primary in place.
+                    mobile_classes_present = other_classes & MOBILE_GROUP
+                    static_classes_present = other_classes & STATIC_GROUP
+                    if (primary["class"] in STATIC_GROUP and len(mobile_classes_present) == 1
+                            and shape_signal_supports_mobile(shape_stats)):
+                        mobile_cand = next(d for d in detections[1:] if d["class"] in MOBILE_GROUP)
+                        reasoning = (
+                            f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
+                            f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
+                            f"organism, not the static reading expected for {primary['class']}."
+                        )
+                        primary = _apply_shape_promotion(detections, primary, mobile_cand, reasoning, shape_stats)
                     elif (primary["class"] in MOBILE_GROUP and primary.get("label_plausible") is False
+                          and len(static_classes_present) == 1
                           and shape_signal_supports_static(shape_stats)):
-                        static_cand = next((d for d in detections[1:] if d["class"] in STATIC_GROUP), None)
-                        if static_cand:
-                            reasoning = (
-                                f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
-                                f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a static/round "
-                                f"organism, and {primary['class']} already failed its own label-plausibility check."
-                            )
-                            primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
+                        static_cand = next(d for d in detections[1:] if d["class"] in STATIC_GROUP)
+                        reasoning = (
+                            f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
+                            f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a static/round "
+                            f"organism, and {primary['class']} already failed its own label-plausibility check."
+                        )
+                        primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
