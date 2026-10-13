@@ -1019,6 +1019,17 @@ async def analyze_video(file: UploadFile = File(...)):
             # docstring for why the window needed to be this long (a shorter
             # 3s test window missed the organism's own slow drift entirely).
             if all_candidates_rejected and not shape_check_applied:
+                # Diagnostic logging added 2026-10-13: the SAME labeled candidate
+                # gave contradictory movement_pattern verdicts (translating vs.
+                # spinning) across two back-to-back real test runs on the same
+                # video. Printing the exact seed coordinates/timestamp used each
+                # time makes it provable whether Roboflow picked a different
+                # underlying position this run (already confirmed non-
+                # deterministic elsewhere in this project) vs. the same position
+                # getting a genuinely different vision-model judgement.
+                print(f"Movement-check seed for primary={primary['class']}: "
+                      f"timestamp={primary.get('timestamp'):.2f}s x={primary.get('x'):.1f} y={primary.get('y'):.1f} "
+                      f"w={primary.get('width'):.1f} h={primary.get('height'):.1f}")
                 try:
                     primary_motion = check_movement_plausibility(
                         tmp_path, fps, TARGET_SIZE, primary,
