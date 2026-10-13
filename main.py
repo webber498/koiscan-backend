@@ -14,7 +14,6 @@ import anthropic
 from motion_costia import find_costia_detection
 from motion_shape_check import (
     check_shape_group, shape_signal_supports_mobile, shape_signal_supports_static,
-    shows_clear_real_movement,
     STATIC_GROUP, MOBILE_GROUP, SHAPE_PROMOTED_FIXED_CONFIDENCE,
 )
 
@@ -340,6 +339,129 @@ def check_costia_candidate_plausible(crop_b64: str):
 
     except Exception as e:
         print(f"Costia candidate plausibility check failed: {str(e)}")
+        return None
+
+
+MOTION_PLAUSIBILITY_INSTRUCTIONS = """These {n} images are closely-spaced consecutive frames from a koi mucus-scrape microscope video, spanning about {duration:.1f} real seconds. All frames show the EXACT SAME fixed crop of the slide - the crop position never changes between frames, only time passes - so any change you see between frames is something actually happening in the scene, not camera movement.
+
+Look at how the scene changes across this sequence, frame by frame. Does the organism near the center show genuine biological movement - gliding or crawling across the slide, independently changing position relative to the background clutter around it, or visibly changing shape/pose over time - consistent with a living, motile organism? Or does it stay essentially fixed in place relative to its surroundings throughout, like a static air bubble, piece of debris, or optical artifact that isn't moving under its own power?
+
+Weigh relative position (compared to fixed background features, not the frame edges) much more heavily than subtle flickering or focus changes, which can happen even to something that isn't really moving.
+
+Respond with ONLY a JSON object, no other text and no markdown fences:
+{{"shows_organism_movement": true/false, "reasoning": "one short sentence describing what you actually observe changing (or not) across the sequence, relative to the background"}}"""
+
+
+def _extract_movement_burst(video_path: str, fps: float, target_size: int, detection: dict,
+                             duration_seconds: float = 3.0, num_frames: int = 10, padding_factor: float = 2.5,
+                             crop_size: int = 400):
+    """Extracts num_frames crops from a FIXED pixel region of the real video
+    (centered on the detection's position, with generous padding for
+    background context) spread across duration_seconds of real time
+    starting at the detection's own timestamp. Deliberately does NOT
+    recenter the crop window per frame (unlike crop_detection) - the whole
+    point is to let a human-like viewer (here, Claude's vision) see the
+    organism's position change RELATIVE TO a fixed background, the same
+    cue a person watching the video naturally uses, instead of us trying to
+    re-derive "did it move" mathematically via point-tracking."""
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not orig_w or not orig_h:
+        cap.release()
+        return [], []
+    scale_x, scale_y = orig_w / target_size, orig_h / target_size
+    cx, cy = detection["x"] * scale_x, detection["y"] * scale_y
+    pad_w = detection["width"] * scale_x * padding_factor
+    pad_h = detection["height"] * scale_y * padding_factor
+    x1, y1 = max(0, int(cx - pad_w / 2)), max(0, int(cy - pad_h / 2))
+    x2, y2 = min(orig_w, int(cx + pad_w / 2)), min(orig_h, int(cy + pad_h / 2))
+
+    seed_frame = int(round(detection["timestamp"] * fps)) if fps else 0
+    total_span_frames = max(1, int(fps * duration_seconds)) if fps else num_frames
+    step = max(1, total_span_frames // num_frames)
+
+    crops_b64, timestamps = [], []
+    for i in range(num_frames):
+        frame_num = seed_frame + i * step
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        h, w = crop.shape[:2]
+        if max(h, w) > crop_size:
+            scale = crop_size / max(h, w)
+            crop = cv2.resize(crop, (int(w * scale), int(h * scale)))
+        _, buffer = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        crops_b64.append(base64.b64encode(buffer).decode('utf-8'))
+        timestamps.append(frame_num / fps if fps else 0)
+    cap.release()
+    return crops_b64, timestamps
+
+
+def check_movement_plausibility(video_path: str, fps: float, target_size: int, detection: dict,
+                                 duration_seconds: float = 3.0, num_frames: int = 10, padding_factor: float = 2.5):
+    """PROTOTYPE (2026-10-13): built after Adam pointed out he could easily
+    tell a real organism from an air bubble just by watching the video, even
+    on footage blurry enough to defeat both the still-frame label-
+    plausibility check and our own point-tracking movement signal (which
+    reduces 10s of motion to a couple of scalar numbers, fragile exactly
+    where a human's holistic perception of motion isn't). Shows Claude's
+    vision a dense burst of closely-spaced frames from a FIXED crop window
+    instead, closer to what a person watching the clip actually sees, rather
+    than trying to re-derive "did it move" mathematically.
+
+    Found testing directly: a 3s window (the original default) was too short
+    to catch a real organism's own slow, loosely-circular drift - confirmed
+    by eye across a longer ~20s span before widening this. duration_seconds/
+    num_frames/padding_factor are exposed so the caller can tune the window
+    to the kind of movement actually being looked for."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    crops_b64, timestamps = _extract_movement_burst(
+        video_path, fps, target_size, detection,
+        duration_seconds=duration_seconds, num_frames=num_frames, padding_factor=padding_factor,
+    )
+    if len(crops_b64) < 3:
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        content = [{"type": "text", "text": f"Candidate class from the detection model: {detection.get('class', 'unknown')}."}]
+        for i, crop in enumerate(crops_b64):
+            content.append({"type": "text", "text": f"Frame {i + 1} (t={timestamps[i]:.2f}s):"})
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": crop}})
+        content.append({
+            "type": "text",
+            "text": MOTION_PLAUSIBILITY_INSTRUCTIONS.format(
+                n=len(crops_b64), duration=timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
+            ),
+        })
+
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+
+        raw = "{" + message.content[0].text
+        print(f"Movement-visual-plausibility raw response: {raw}")
+        result = json.loads(raw)
+
+        return {
+            "shows_organism_movement": bool(result.get("shows_organism_movement", False)),
+            "reasoning": str(result.get("reasoning", ""))[:400],
+        }
+
+    except Exception as e:
+        print(f"Movement-visual-plausibility check failed: {str(e)}")
         return None
 
 
@@ -853,65 +975,68 @@ async def analyze_video(file: UploadFile = File(...)):
                         primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
                         shape_check_applied = True
 
-            # PROTOTYPE (2026-10-13): translational-movement corroboration,
-            # built same day after Adam pointed out the shape-only signal
-            # (which only measures whether an organism's OUTLINE flexes)
-            # couldn't have caught a real miss: an air bubble out-ranked a
-            # genuinely moving Chilodonella on Roboflow's own frame-count,
-            # and every candidate failed its visual check. The shape/group
-            # check above can't help there either - all 3 candidates were in
-            # the SAME movement group, so it never ran.
+            # PROTOTYPE (2026-10-13): movement corroboration via Claude's own
+            # vision, not point-tracking math. Built same day after a real,
+            # multi-round investigation: the shape-only signal (does the
+            # outline flex?) couldn't catch an air bubble out-ranking a
+            # genuinely moving Chilodonella, since both were in the same
+            # movement group. A hand-built point-tracking replacement
+            # (path_length_bl) was tried next, but proved fragile - a smooth,
+            # low-texture object's tracked points can silently drift off it
+            # (the aperture problem), and even once that was fixed with a
+            # texture gate, Adam pointed out the deeper issue directly: he
+            # could easily tell the real organism from the bubble just by
+            # watching the video, even on footage blurry enough to defeat
+            # every one of these still-frame or scalar-statistic checks.
             #
-            # Was downgraded to log-only the same day after real testing found
-            # path_length_bl unreliable (a static bubble read as moving 5-19
-            # body-lengths), then re-enabled once the real cause was found and
-            # fixed: a smooth, low-texture object's tracked points silently
-            # drift off it (the aperture problem), which the new texture gate
-            # in shows_no_real_movement/shows_clear_real_movement now catches
-            # before trusting any reading - see motion_shape_check.py's
-            # MIN_TEXTURE_VARIANCE docstring for the full investigation and
-            # real numbers behind it. Per Adam: since he's currently the only
-            # user, there's no real-world risk in letting this act again now
-            # rather than waiting on more log-only examples first.
+            # This asks Claude's vision the question directly instead of
+            # re-deriving it mathematically: shown a dense burst of frames
+            # from a FIXED crop window over a real ~25s span (closer to
+            # what a person watching the clip actually perceives), does this
+            # candidate visibly move relative to the background, or stay put?
+            # Verified directly against the real bubble-vs-Chilodonella pair
+            # from today's testing: correctly read the bubble as not moving
+            # and the real organism as "gliding... relative to fixed
+            # background debris" - succeeding exactly where the point-
+            # tracking approach kept failing. See check_movement_plausibility's
+            # docstring for why the window needed to be this long (a shorter
+            # 3s test window missed the organism's own slow drift entirely).
             if all_candidates_rejected and not shape_check_applied:
                 try:
-                    primary_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, primary)
+                    primary_motion = check_movement_plausibility(
+                        tmp_path, fps, TARGET_SIZE, primary,
+                        duration_seconds=25.0, num_frames=12, padding_factor=4.0,
+                    )
                 except Exception as e:
-                    primary_movement = None
-                    print(f"Movement-corroboration check failed (non-fatal): {e}")
-                if primary_movement:
-                    print(f"Movement-check for primary={primary['class']}: {primary_movement}")
-                    # NOT shows_clear_real_movement, not shows_no_real_movement: the real
-                    # case this was built for (a smooth air bubble mislabeled as a static-
-                    # group species) reads as insufficient_texture, not confidently static -
-                    # shows_no_real_movement requires CONFIDENCE it's static, which an
-                    # untrustworthy reading can never provide. What actually matters here is
-                    # just that the primary ISN'T confidently showing real movement itself,
-                    # whatever the reason - confidently static, or unreliable/untextured -
-                    # while a specific alternative candidate IS confidently moving.
-                    if not shows_clear_real_movement(primary_movement):
+                    primary_motion = None
+                    print(f"Movement-visual-plausibility check failed (non-fatal): {e}")
+                if primary_motion:
+                    print(f"Movement-visual-check for primary={primary['class']}: {primary_motion}")
+                    if not primary_motion["shows_organism_movement"]:
                         moving_cands = []
                         for cand in detections[1:]:
                             try:
-                                cand_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, cand)
+                                cand_motion = check_movement_plausibility(
+                                    tmp_path, fps, TARGET_SIZE, cand,
+                                    duration_seconds=25.0, num_frames=12, padding_factor=4.0,
+                                )
                             except Exception as e:
-                                cand_movement = None
-                                print(f"Movement-corroboration check failed for {cand['class']} (non-fatal): {e}")
-                            if cand_movement:
-                                print(f"Movement-check for {cand['class']}: {cand_movement}")
-                                if shows_clear_real_movement(cand_movement):
-                                    moving_cands.append((cand, cand_movement))
+                                cand_motion = None
+                                print(f"Movement-visual-plausibility check failed for {cand['class']} (non-fatal): {e}")
+                            if cand_motion:
+                                print(f"Movement-visual-check for {cand['class']}: {cand_motion}")
+                                if cand_motion["shows_organism_movement"]:
+                                    moving_cands.append((cand, cand_motion))
                         if len(moving_cands) == 1:
-                            alt_cand, alt_movement = moving_cands[0]
+                            alt_cand, alt_motion = moving_cands[0]
                             reasoning = (
-                                f"Movement tracking found {primary['class']} essentially static "
-                                f"(path_length={primary_movement['path_length_bl']} body-lengths) while "
-                                f"{alt_cand['class']} showed clear real movement "
-                                f"(path_length={alt_movement['path_length_bl']} body-lengths) - more "
-                                f"consistent with {alt_cand['class']} being the actual living organism, "
-                                f"especially since every candidate here failed its own visual check."
+                                f"Visual movement check found {primary['class']} showing no real movement "
+                                f"({primary_motion['reasoning']}) while {alt_cand['class']} showed clear "
+                                f"movement ({alt_motion['reasoning']}) - more consistent with {alt_cand['class']} "
+                                f"being the actual living organism, especially since every candidate here "
+                                f"failed its own visual plausibility check."
                             )
-                            primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_movement)
+                            primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_motion)
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
