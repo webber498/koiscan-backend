@@ -770,12 +770,24 @@ async def analyze_video(file: UploadFile = File(...)):
                     if primary["class"] in STATIC_GROUP and shape_signal_supports_mobile(shape_stats):
                         mobile_cand = next((d for d in detections[1:] if d["class"] in MOBILE_GROUP), None)
                         if mobile_cand:
+                            old_primary = primary
                             mobile_cand["shape_promoted"] = True
                             mobile_cand["shape_promotion_reasoning"] = (
                                 f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
                                 f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
                                 f"organism, not the static reading expected for {primary['class']}."
                             )
+                            # The same-organism check above ran with the OLD primary, and
+                            # "are these the same organism" doesn't depend on which one is
+                            # labelled primary - carry that verdict over to whichever one is
+                            # now demoted. Without this, the frontend's duplicate-secondary
+                            # filter (which only ever checks a SECONDARY's own flag) has no
+                            # idea the demoted detection is a duplicate of the new primary,
+                            # and shows it as a separate, confusingly higher-confidence
+                            # "Also Found" result - confirmed directly as a real bug testing
+                            # this today.
+                            old_primary["same_organism_as_primary"] = mobile_cand.pop("same_organism_as_primary", None)
+                            old_primary["same_organism_reasoning"] = mobile_cand.pop("same_organism_reasoning", None)
                             print(f"Primary promoted from {primary['class']} to {mobile_cand['class']} based on the shape-corroboration signal ({shape_stats})")
                             detections.remove(mobile_cand)
                             detections.insert(0, mobile_cand)
