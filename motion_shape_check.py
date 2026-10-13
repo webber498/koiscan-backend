@@ -133,7 +133,18 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
     debris shouldn't translate at all. Normalized to body-lengths (using the
     detection's own box size) so it's comparable across different zoom
     levels, the same convention the original (pre-shape-signal) tracker
-    prototype used for its own speed_bl_per_sec stat."""
+    prototype used for its own speed_bl_per_sec stat.
+
+    RELIABILITY CAVEAT, found the same day testing against real footage: a
+    visually-confirmed STATIC air bubble read path_length_bl of 5-19 across
+    three separate real tests (two different crops of the same source video,
+    with and without unrelated screen-recording UI in frame) - clearly wrong
+    if taken at face value. Camera-motion compensation was tried and ruled
+    out as the fix (see the loop below) - whatever's really inflating this
+    number on real footage isn't understood yet. Because of this, main.py
+    currently only LOGS path_length_bl/speed_bl_per_sec for visibility and
+    does NOT let them promote or demote a result - only the (separately and
+    more thoroughly validated) aspect-ratio/shape stats are trusted to act."""
     cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -162,6 +173,18 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
     n_reseeds = 0
     frames_processed = 0
 
+    # Tried camera-motion compensation here (2026-10-13, after Adam correctly
+    # pointed out that a handheld recording's own drift could show up as
+    # false "movement" for a genuinely static object), reusing the same
+    # phase-correlation technique motion_costia.py uses to stabilize against
+    # camera drift. Tested directly against a real video with a known-static
+    # air bubble, both with and without unrelated screen-recording UI in
+    # frame - it did NOT fix the bubble's inflated reading either time (if
+    # anything, the number got worse), so whatever's inflating path_length_bl
+    # on real footage isn't simple whole-frame camera panning, and this
+    # "fix" wasn't earning its complexity. Reverted rather than ship an
+    # unproven correction - see PATH_LENGTH_RELIABILITY_CAVEAT below and the
+    # Phase 3 commit history for the full investigation.
     for _ in range(max_frames):
         ret, frame = cap.read()
         if not ret:
