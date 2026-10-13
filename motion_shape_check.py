@@ -50,6 +50,19 @@ import numpy as np
 STATIC_GROUP = {"White Spot", "Trichodina", "Chilodonella"}
 MOBILE_GROUP = {"Gill Flukes", "Skin Fluke"}
 
+# Phase 3 (2026-10-13): threshold for letting this signal actually promote a
+# candidate, picked from the real numbers gathered validating this method,
+# not guessed. Every CLEAN (n_reseeds==0) static-group reading measured so
+# far: Ich 0.046, Trichodina 0.106, Chilodonella 0.106 - all comfortably
+# under 0.2. Every mobile-group reading except one resting-moment outlier:
+# Gill Fluke 0.389/2.561, Skin Fluke 1.567/1.836/7.697 - all comfortably
+# over 0.35. Picked 0.35 to sit in that gap with margin on both sides.
+# Deliberately NOT centered/symmetric - see the one-directional note at this
+# constant's only use site for why a LOW reading is never used to confirm a
+# static primary (a resting fluke measured as low as 0.014, lower than any
+# static reading seen).
+SHAPE_PROMOTE_MOBILE_THRESHOLD = 0.35
+
 TRACK_SECONDS = 10
 MAX_CORNERS = 30
 MIN_POINTS_TO_RESEED = 8
@@ -152,3 +165,17 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
         "aspect_ratio_std": round(float(np.std(ratios)), 3),
         "n_reseeds": n_reseeds,
     }
+
+
+def shape_signal_supports_mobile(stats):
+    """True only when the reading is BOTH high enough and trustworthy enough
+    to say "this looks like a flexing/mobile organism, not a static one" -
+    requires n_reseeds==0 (the one real false-positive case found during
+    validation, a messy Chilodonella video reading 4.113, needed 4 reseeds
+    and should never have been trusted) as well as clearing
+    SHAPE_PROMOTE_MOBILE_THRESHOLD."""
+    return (
+        stats is not None
+        and stats["n_reseeds"] == 0
+        and stats["aspect_ratio_range"] >= SHAPE_PROMOTE_MOBILE_THRESHOLD
+    )

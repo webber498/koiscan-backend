@@ -12,7 +12,7 @@ import re
 import anthropic
 
 from motion_costia import find_costia_detection
-from motion_shape_check import check_shape_group, STATIC_GROUP, MOBILE_GROUP
+from motion_shape_check import check_shape_group, shape_signal_supports_mobile, STATIC_GROUP, MOBILE_GROUP
 
 app = FastAPI()
 
@@ -731,15 +731,29 @@ async def analyze_video(file: UploadFile = File(...)):
                         det["same_organism_as_primary"] = comparison["same_organism"]
                         det["same_organism_reasoning"] = comparison["reasoning"]
 
-            # PROTOTYPE, Phase 2 (2026-10-13): shape-corroboration check, computed
-            # and LOGGED ONLY - must not affect detections or what's returned to
-            # the user (see motion_shape_check.py's docstring for the full
-            # reasoning and the two real misclassifications this is built
-            # against). Deliberately narrow trigger: only runs when the primary
-            # and some OTHER detected candidate actually disagree on which of
-            # the two movement groups they're in - this is a direct match for
-            # both real bugs found today, and keeps the cost of this expensive,
-            # still-unproven check off every ordinary scan.
+            # PROTOTYPE, Phase 3 (2026-10-13): the shape-corroboration signal now
+            # gets a real say in the result, not just a log line - per Adam's
+            # explicit call once the very first real production example (this
+            # same day) showed exactly why: a Gill Fluke compressed in its
+            # sampled frames read as a free-living ciliate to the still-frame
+            # label-plausibility check (label_plausible=False on BOTH
+            # candidates), while this shape signal correctly read strongly
+            # "mobile" for the same video (aspect_ratio_range=4.861,
+            # n_reseeds=0) - see motion_shape_check.py's docstring for the
+            # full validation history behind the threshold used here.
+            #
+            # Deliberately ONE-DIRECTIONAL: only ever promotes a MOBILE_GROUP
+            # secondary over a STATIC_GROUP primary, never the reverse. A
+            # resting mobile fluke was measured reading as low as 0.014 during
+            # validation - lower than any static-group reading seen - so a LOW
+            # reading can never safely be used to confirm a static primary is
+            # correct. There's no real-world case yet needing that direction,
+            # only evidence for this one.
+            #
+            # Trigger stays narrow on purpose: only runs this expensive,
+            # still-fairly-new check when the primary and some OTHER detected
+            # candidate actually disagree on movement group - a direct match
+            # for the real bugs found today, keeping the cost off ordinary scans.
             other_classes = {d["class"] for d in detections[1:]}
             cross_group_ambiguity = (
                 (primary["class"] in STATIC_GROUP and other_classes & MOBILE_GROUP) or
@@ -748,10 +762,24 @@ async def analyze_video(file: UploadFile = File(...)):
             if cross_group_ambiguity:
                 try:
                     shape_stats = check_shape_group(tmp_path, fps, TARGET_SIZE, primary)
-                    if shape_stats:
-                        print(f"Shape-check (log-only) for primary={primary['class']} vs. secondaries={other_classes}: {shape_stats}")
                 except Exception as e:
+                    shape_stats = None
                     print(f"Shape-corroboration check failed (non-fatal): {e}")
+                if shape_stats:
+                    print(f"Shape-check for primary={primary['class']} vs. secondaries={other_classes}: {shape_stats}")
+                    if primary["class"] in STATIC_GROUP and shape_signal_supports_mobile(shape_stats):
+                        mobile_cand = next((d for d in detections[1:] if d["class"] in MOBILE_GROUP), None)
+                        if mobile_cand:
+                            mobile_cand["shape_promoted"] = True
+                            mobile_cand["shape_promotion_reasoning"] = (
+                                f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
+                                f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
+                                f"organism, not the static reading expected for {primary['class']}."
+                            )
+                            print(f"Primary promoted from {primary['class']} to {mobile_cand['class']} based on the shape-corroboration signal ({shape_stats})")
+                            detections.remove(mobile_cand)
+                            detections.insert(0, mobile_cand)
+                            primary = mobile_cand
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
