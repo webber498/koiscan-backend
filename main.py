@@ -17,6 +17,17 @@ from motion_shape_check import (
     STATIC_GROUP, MOBILE_GROUP, SHAPE_PROMOTED_FIXED_CONFIDENCE,
 )
 
+# Per Adam's own domain knowledge (2026-10-13): within STATIC_GROUP, Trichodina
+# spins/vibrates largely in place while Chilodonella glides a real distance
+# across the slide - genuinely different movement characters once an organism
+# is already confirmed to be alive and moving (see check_movement_plausibility's
+# "movement_pattern" field). Nothing established yet for White Spot, so it's
+# deliberately left out rather than guessed.
+EXPECTED_MOVEMENT_PATTERN = {
+    "Trichodina": "spinning_in_place",
+    "Chilodonella": "translating_across_frame",
+}
+
 app = FastAPI()
 
 app.add_middleware(
@@ -348,8 +359,10 @@ Look at how the scene changes across this sequence, frame by frame. Does the org
 
 Weigh relative position (compared to fixed background features, not the frame edges) much more heavily than subtle flickering or focus changes, which can happen even to something that isn't really moving.
 
+If it does show real movement, also judge the CHARACTER of that movement: does it mostly spin, rotate, or vibrate around a roughly fixed spot without actually travelling far (like a top spinning in place)? Or does it clearly glide/crawl/travel a real distance across the visible field over time, ending up near different background features than it started near? If it shows no real movement, or the pattern genuinely isn't clear either way, say so honestly rather than guessing.
+
 Respond with ONLY a JSON object, no other text and no markdown fences:
-{{"shows_organism_movement": true/false, "reasoning": "one short sentence describing what you actually observe changing (or not) across the sequence, relative to the background"}}"""
+{{"shows_organism_movement": true/false, "movement_pattern": "spinning_in_place"/"translating_across_frame"/"unclear", "reasoning": "one short sentence describing what you actually observe changing (or not) across the sequence, relative to the background"}}"""
 
 
 def _extract_movement_burst(video_path: str, fps: float, target_size: int, detection: dict,
@@ -455,8 +468,12 @@ def check_movement_plausibility(video_path: str, fps: float, target_size: int, d
         print(f"Movement-visual-plausibility raw response: {raw}")
         result = json.loads(raw)
 
+        movement_pattern = result.get("movement_pattern")
         return {
             "shows_organism_movement": bool(result.get("shows_organism_movement", False)),
+            "movement_pattern": movement_pattern if movement_pattern in (
+                "spinning_in_place", "translating_across_frame", "unclear"
+            ) else "unclear",
             "reasoning": str(result.get("reasoning", ""))[:400],
         }
 
@@ -1037,6 +1054,52 @@ async def analyze_video(file: UploadFile = File(...)):
                                 f"failed its own visual plausibility check."
                             )
                             primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_motion)
+                    else:
+                        # PROTOTYPE (2026-10-13): found testing the check above - a real,
+                        # confirmed-moving organism can still be given the WRONG SPECIES
+                        # NAME by Roboflow (the detection was real, just mislabeled), which
+                        # the "is primary static" check above can't catch since the primary
+                        # really is moving. Per Adam's own domain knowledge: Trichodina
+                        # spins/vibrates largely in place, Chilodonella glides a real
+                        # distance across the slide - two movement GROUP members
+                        # (STATIC_GROUP) with genuinely different movement characters once
+                        # you know both are alive. If primary's claimed class has a known
+                        # expected pattern and the OBSERVED pattern contradicts it, check
+                        # whether exactly one other candidate's claimed class matches the
+                        # pattern actually observed - and independently confirm THAT
+                        # candidate also moves with its own expected pattern - before
+                        # relabeling. Only Trichodina/Chilodonella have an established
+                        # expected pattern so far (nothing conclusive yet for White Spot).
+                        expected_pattern = EXPECTED_MOVEMENT_PATTERN.get(primary["class"])
+                        observed_pattern = primary_motion.get("movement_pattern")
+                        if expected_pattern and observed_pattern not in (None, "unclear") and observed_pattern != expected_pattern:
+                            pattern_matched_cands = []
+                            for cand in detections[1:]:
+                                if EXPECTED_MOVEMENT_PATTERN.get(cand["class"]) != observed_pattern:
+                                    continue
+                                try:
+                                    cand_motion = check_movement_plausibility(
+                                        tmp_path, fps, TARGET_SIZE, cand,
+                                        duration_seconds=25.0, num_frames=12, padding_factor=4.0,
+                                    )
+                                except Exception as e:
+                                    cand_motion = None
+                                    print(f"Movement-visual-plausibility check failed for {cand['class']} (non-fatal): {e}")
+                                if cand_motion:
+                                    print(f"Movement-visual-check for {cand['class']}: {cand_motion}")
+                                    if (cand_motion["shows_organism_movement"]
+                                            and cand_motion.get("movement_pattern") == observed_pattern):
+                                        pattern_matched_cands.append((cand, cand_motion))
+                            if len(pattern_matched_cands) == 1:
+                                alt_cand, alt_motion = pattern_matched_cands[0]
+                                reasoning = (
+                                    f"Visual movement check found {primary['class']} moving with a "
+                                    f"'{observed_pattern}' pattern ({primary_motion['reasoning']}) - inconsistent "
+                                    f"with {primary['class']}'s own expected movement, but matching "
+                                    f"{alt_cand['class']}'s expected pattern instead, independently confirmed "
+                                    f"({alt_motion['reasoning']})."
+                                )
+                                primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_motion)
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
