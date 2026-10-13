@@ -113,13 +113,27 @@ def _seed_points(gray, cx, cy, half_w, half_h, max_corners=MAX_CORNERS):
 
 def check_shape_group(video_path: str, fps: float, target_size: int, detection: dict):
     """Tracks the given detection's organism via sparse optical flow for
-    ~10s and returns the raw aspect-ratio stats, or None if tracking
-    couldn't get started (e.g. the seed frame can't be read). detection is
-    one of main.py's own detection dicts - x/y/width/height are expected in
-    the 1024x1024-resized-frame space Roboflow actually saw, same as
-    everywhere else in main.py, and are converted back to the video's real
-    pixel resolution here (mirrors the scaling motion_costia.py already
-    does the same way, just inverted)."""
+    ~10s and returns the raw aspect-ratio AND translational-movement stats,
+    or None if tracking couldn't get started (e.g. the seed frame can't be
+    read). detection is one of main.py's own detection dicts - x/y/width/
+    height are expected in the 1024x1024-resized-frame space Roboflow
+    actually saw, same as everywhere else in main.py, and are converted
+    back to the video's real pixel resolution here (mirrors the scaling
+    motion_costia.py already does the same way, just inverted).
+
+    Added 2026-10-13 (same day, after Adam pointed out a real miss the
+    shape-only signal couldn't have caught): path_length_bl/speed_bl_per_sec
+    measure how far the tracked points' CENTROID travels across the screen,
+    reusing the exact same tracked points already being followed for the
+    shape reading - genuinely different information from aspect-ratio range.
+    An organism that stretches and compresses in place (a fluke) can score
+    high on shape variability while barely translating; an organism that
+    glides across the slide (Chilodonella, per Adam) or spins in place
+    (Trichodina) moves very differently again - and a static air bubble or
+    debris shouldn't translate at all. Normalized to body-lengths (using the
+    detection's own box size) so it's comparable across different zoom
+    levels, the same convention the original (pre-shape-signal) tracker
+    prototype used for its own speed_bl_per_sec stat."""
     cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -137,18 +151,22 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
 
     cx, cy = detection["x"] * scale_x, detection["y"] * scale_y
     half_w, half_h = (detection["width"] * scale_x) / 2, (detection["height"] * scale_y) / 2
+    body_size_px = half_w + half_h  # average of real-world box width/height
 
     prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     points = _seed_points(prev_gray, cx, cy, half_w, half_h)
 
     max_frames = int(fps * TRACK_SECONDS) if fps else 0
     spreads = []
+    centroids = []
     n_reseeds = 0
+    frames_processed = 0
 
     for _ in range(max_frames):
         ret, frame = cap.read()
         if not ret:
             break
+        frames_processed += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if len(points) >= 2:
@@ -165,6 +183,9 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
                 points = fresh
                 n_reseeds += 1
 
+        if len(points) >= 1:
+            centroids.append((float(points[:, 0].mean()), float(points[:, 1].mean())))
+
         spread = _pca_spread(points)
         if spread:
             spreads.append(spread)
@@ -173,8 +194,17 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
 
     cap.release()
 
+    path_length_px = sum(
+        ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+        for (x1, y1), (x2, y2) in zip(centroids, centroids[1:])
+    )
+    path_length_bl = round(path_length_px / body_size_px, 3) if body_size_px > 1e-6 else 0.0
+    tracked_seconds = frames_processed / fps if fps else 0
+    speed_bl_per_sec = round(path_length_bl / tracked_seconds, 3) if tracked_seconds > 1e-6 else 0.0
+
     if not spreads:
-        return {"num_points": 0, "aspect_ratio_mean": 1.0, "aspect_ratio_range": 0.0, "aspect_ratio_std": 0.0, "n_reseeds": n_reseeds}
+        return {"num_points": 0, "aspect_ratio_mean": 1.0, "aspect_ratio_range": 0.0, "aspect_ratio_std": 0.0,
+                "n_reseeds": n_reseeds, "path_length_bl": path_length_bl, "speed_bl_per_sec": speed_bl_per_sec}
 
     ratios = [major / minor if minor > 1e-6 else 1.0 for major, minor in spreads]
     return {
@@ -183,6 +213,8 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
         "aspect_ratio_range": round(float(max(ratios) - min(ratios)), 3),
         "aspect_ratio_std": round(float(np.std(ratios)), 3),
         "n_reseeds": n_reseeds,
+        "path_length_bl": path_length_bl,
+        "speed_bl_per_sec": speed_bl_per_sec,
     }
 
 
@@ -226,4 +258,41 @@ def shape_signal_supports_static(stats):
         stats is not None
         and stats["n_reseeds"] == 0
         and stats["aspect_ratio_range"] <= SHAPE_DEMOTE_STATIC_THRESHOLD
+    )
+
+
+# Movement-corroboration thresholds (2026-10-13), for path_length_bl -
+# UNLIKE the aspect-ratio thresholds above, these are NOT yet backed by a
+# set of real measured examples the way those were (9 videos before any
+# threshold was trusted). This is a first, reasoned starting point: a
+# genuinely gliding/crawling organism should cover at least a full body
+# length or so over a 10s window, while a static air bubble or debris
+# shouldn't meaningfully travel at all. Log every raw path_length_bl value
+# and revisit these two numbers once real production examples come in -
+# same calibration discipline used to derive SHAPE_PROMOTE_MOBILE_THRESHOLD,
+# just not done yet for this particular metric.
+MOVEMENT_STATIC_THRESHOLD_BL = 0.3
+MOVEMENT_REAL_THRESHOLD_BL = 1.0
+
+
+def shows_no_real_movement(stats):
+    """True when the tracked centroid barely moved and the track is
+    trustworthy (n_reseeds==0) - consistent with a static artifact (an air
+    bubble, debris) rather than a living, moving organism."""
+    return (
+        stats is not None
+        and stats["n_reseeds"] == 0
+        and stats["path_length_bl"] < MOVEMENT_STATIC_THRESHOLD_BL
+    )
+
+
+def shows_clear_real_movement(stats):
+    """True when the tracked centroid travelled a real distance and the
+    track is trustworthy (n_reseeds==0) - consistent with a genuinely
+    moving, living organism (gliding, spinning in place with some drift,
+    etc.) rather than a static artifact."""
+    return (
+        stats is not None
+        and stats["n_reseeds"] == 0
+        and stats["path_length_bl"] >= MOVEMENT_REAL_THRESHOLD_BL
     )

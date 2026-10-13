@@ -14,6 +14,7 @@ import anthropic
 from motion_costia import find_costia_detection
 from motion_shape_check import (
     check_shape_group, shape_signal_supports_mobile, shape_signal_supports_static,
+    shows_no_real_movement, shows_clear_real_movement,
     STATIC_GROUP, MOBILE_GROUP, SHAPE_PROMOTED_FIXED_CONFIDENCE,
 )
 
@@ -741,6 +742,11 @@ async def analyze_video(file: UploadFile = File(...)):
                 if plausibility["label_plausible"]:
                     chosen = cand
                     break
+            # True only when every candidate was actually, successfully checked
+            # and every one of them came back implausible - not when the loop
+            # broke early because a check couldn't run at all. A clean signal
+            # that something is off (see the movement-corroboration block below).
+            all_candidates_rejected = chosen is None
             if chosen is None:
                 chosen = detections[0]  # none of them passed - fall back to the original top
 
@@ -802,6 +808,7 @@ async def analyze_video(file: UploadFile = File(...)):
                 (primary["class"] in STATIC_GROUP and other_classes & MOBILE_GROUP) or
                 (primary["class"] in MOBILE_GROUP and other_classes & STATIC_GROUP)
             )
+            shape_check_applied = False
             if cross_group_ambiguity:
                 try:
                     shape_stats = check_shape_group(tmp_path, fps, TARGET_SIZE, primary)
@@ -833,6 +840,7 @@ async def analyze_video(file: UploadFile = File(...)):
                             f"organism, not the static reading expected for {primary['class']}."
                         )
                         primary = _apply_shape_promotion(detections, primary, mobile_cand, reasoning, shape_stats)
+                        shape_check_applied = True
                     elif (primary["class"] in MOBILE_GROUP and primary.get("label_plausible") is False
                           and len(static_classes_present) == 1
                           and shape_signal_supports_static(shape_stats)):
@@ -843,6 +851,52 @@ async def analyze_video(file: UploadFile = File(...)):
                             f"organism, and {primary['class']} already failed its own label-plausibility check."
                         )
                         primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
+                        shape_check_applied = True
+
+            # PROTOTYPE (2026-10-13): translational-movement corroboration, built
+            # same day after Adam pointed out the shape-only signal (which only
+            # measures whether an organism's OUTLINE flexes) couldn't have caught
+            # a real miss: an air bubble out-ranked a genuinely moving Chilodonella
+            # on Roboflow's own frame-count, and every candidate failed its visual
+            # check (nothing to visually confirm against). The shape/group check
+            # above can't help here either - all 3 candidates were in the SAME
+            # movement group, so it never even ran. This checks something
+            # different: does the primary actually TRANSLATE across the screen at
+            # all? A real organism should (Trichodina spins with some drift,
+            # Chilodonella glides further, per Adam's own description) - a static
+            # air bubble or debris shouldn't move meaningfully. Only runs when
+            # every candidate already failed its own visual check (a clean signal
+            # something's off) and the shape/group check above didn't already act,
+            # and only promotes when there's exactly one specific alternative
+            # candidate to compare against - same "don't invent a guess between
+            # multiple options" discipline as the check above.
+            if all_candidates_rejected and not shape_check_applied and len(detections) == 2:
+                try:
+                    primary_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, primary)
+                except Exception as e:
+                    primary_movement = None
+                    print(f"Movement-corroboration check failed (non-fatal): {e}")
+                if primary_movement:
+                    print(f"Movement-check for primary={primary['class']}: {primary_movement}")
+                    if shows_no_real_movement(primary_movement):
+                        alt_cand = detections[1]
+                        try:
+                            alt_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, alt_cand)
+                        except Exception as e:
+                            alt_movement = None
+                            print(f"Movement-corroboration check failed for alternative (non-fatal): {e}")
+                        if alt_movement:
+                            print(f"Movement-check for alternative={alt_cand['class']}: {alt_movement}")
+                            if shows_clear_real_movement(alt_movement):
+                                reasoning = (
+                                    f"Movement tracking found {primary['class']} essentially static "
+                                    f"(path_length={primary_movement['path_length_bl']} body-lengths) while "
+                                    f"{alt_cand['class']} showed clear real movement "
+                                    f"(path_length={alt_movement['path_length_bl']} body-lengths) - more "
+                                    f"consistent with {alt_cand['class']} being the actual living organism, "
+                                    f"especially since every candidate here failed its own visual check."
+                                )
+                                primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_movement)
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
