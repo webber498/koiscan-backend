@@ -111,6 +111,24 @@ def _seed_points(gray, cx, cy, half_w, half_h, max_corners=MAX_CORNERS):
     return pts.reshape(-1, 2) if pts is not None else np.zeros((0, 2))
 
 
+# Texture gate (2026-10-13) - see the full investigation in check_shape_group's
+# docstring. Real numbers measured directly: known-static bubbles (artifacts)
+# 3.8-5.8, a confirmed-real Gill Fluke in a SOFTER/lower-res video 256-345,
+# plain background texture in a crisp video 173, a confirmed-real
+# Chilodonella in that same crisp video 1202. Absolute sharpness varies a lot
+# between videos (the Gill Fluke reading is lower than plain background in a
+# different, crisper video) - so this is set low, just high enough to
+# reliably exclude smooth artifacts (which read single digits, a >30x gap
+# below every real-content reading seen so far) rather than trying to also
+# distinguish organism from background, which isn't what this gate is for.
+# Not yet validated across many examples - grounded in an actual measured
+# gap, not a guess, but still a first cut. Two earlier fix attempts (camera-
+# motion compensation, then periodic template-match drift-detection) were
+# tried and ruled out first - see commit history / check_shape_group's
+# docstring for why each didn't work.
+MIN_TEXTURE_VARIANCE = 50
+
+
 def check_shape_group(video_path: str, fps: float, target_size: int, detection: dict):
     """Tracks the given detection's organism via sparse optical flow for
     ~10s and returns the raw aspect-ratio AND translational-movement stats,
@@ -165,6 +183,46 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
     body_size_px = half_w + half_h  # average of real-world box width/height
 
     prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Texture gate (2026-10-13), checked BEFORE tracking even starts. Found
+    # the real cause of path_length_bl's bad readings by direct investigation:
+    # a smooth object (a bubble) has almost no internal texture for optical
+    # flow to anchor to, only its thin ring edge - and tracking a point sitting
+    # exactly on an edge is a classic weak spot (the aperture problem), so
+    # points slowly slide along the edge over many frames, with each reseed
+    # re-centering on wherever the track CURRENTLY (already wrongly) believes
+    # the object is, compounding the drift rather than correcting it.
+    # Confirmed directly: the tracked centroid ended up 200px from the real,
+    # still-unmoved bubble after a 10s track.
+    #
+    # Two things were tried and ruled out before this: camera-motion
+    # compensation (didn't fix the bubble's reading - real cause wasn't
+    # camera panning) and periodic template-matching drift-detection (the
+    # match score stayed high, 0.7-0.99, even 200px off-target, because this
+    # kind of blurry mucus/tissue background is repetitive enough that
+    # "generic blur" matches "more generic blur" almost as well as the real
+    # original spot - not discriminative enough on this content).
+    #
+    # What actually separates a trustworthy object from one: Laplacian
+    # variance (a standard texture-richness measure) of the seed crop,
+    # BEFORE any tracking. Measured directly on real footage: a known-static
+    # bubble read 5.8, a confirmed-real organism in a clean video read 1202,
+    # and even plain BACKGROUND texture in that same clean video read 173 -
+    # a two-orders-of-magnitude gap between "real, trackable organism" and
+    # "artifact/too smooth to trust", with a clear margin above ordinary
+    # background texture too. MIN_TEXTURE_VARIANCE sits in that gap. If the
+    # seed region fails this, there's no point spending a ~10s tracking pass
+    # on it at all - return immediately with insufficient_texture=True.
+    seed_y1, seed_y2 = max(0, int(cy - half_h)), int(cy + half_h)
+    seed_x1, seed_x2 = max(0, int(cx - half_w)), int(cx + half_w)
+    seed_crop = prev_gray[seed_y1:seed_y2, seed_x1:seed_x2]
+    texture_variance = float(cv2.Laplacian(seed_crop, cv2.CV_64F).var()) if seed_crop.size else 0.0
+    if texture_variance < MIN_TEXTURE_VARIANCE:
+        cap.release()
+        return {"num_points": 0, "aspect_ratio_mean": 1.0, "aspect_ratio_range": 0.0, "aspect_ratio_std": 0.0,
+                "n_reseeds": 0, "path_length_bl": 0.0, "speed_bl_per_sec": 0.0,
+                "texture_variance": round(texture_variance, 1), "insufficient_texture": True}
+
     points = _seed_points(prev_gray, cx, cy, half_w, half_h)
 
     max_frames = int(fps * TRACK_SECONDS) if fps else 0
@@ -173,18 +231,6 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
     n_reseeds = 0
     frames_processed = 0
 
-    # Tried camera-motion compensation here (2026-10-13, after Adam correctly
-    # pointed out that a handheld recording's own drift could show up as
-    # false "movement" for a genuinely static object), reusing the same
-    # phase-correlation technique motion_costia.py uses to stabilize against
-    # camera drift. Tested directly against a real video with a known-static
-    # air bubble, both with and without unrelated screen-recording UI in
-    # frame - it did NOT fix the bubble's inflated reading either time (if
-    # anything, the number got worse), so whatever's inflating path_length_bl
-    # on real footage isn't simple whole-frame camera panning, and this
-    # "fix" wasn't earning its complexity. Reverted rather than ship an
-    # unproven correction - see PATH_LENGTH_RELIABILITY_CAVEAT below and the
-    # Phase 3 commit history for the full investigation.
     for _ in range(max_frames):
         ret, frame = cap.read()
         if not ret:
@@ -227,7 +273,8 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
 
     if not spreads:
         return {"num_points": 0, "aspect_ratio_mean": 1.0, "aspect_ratio_range": 0.0, "aspect_ratio_std": 0.0,
-                "n_reseeds": n_reseeds, "path_length_bl": path_length_bl, "speed_bl_per_sec": speed_bl_per_sec}
+                "n_reseeds": n_reseeds, "path_length_bl": path_length_bl, "speed_bl_per_sec": speed_bl_per_sec,
+                "texture_variance": round(texture_variance, 1), "insufficient_texture": False}
 
     ratios = [major / minor if minor > 1e-6 else 1.0 for major, minor in spreads]
     return {
@@ -238,6 +285,8 @@ def check_shape_group(video_path: str, fps: float, target_size: int, detection: 
         "n_reseeds": n_reseeds,
         "path_length_bl": path_length_bl,
         "speed_bl_per_sec": speed_bl_per_sec,
+        "texture_variance": round(texture_variance, 1),
+        "insufficient_texture": False,
     }
 
 
@@ -246,11 +295,15 @@ def shape_signal_supports_mobile(stats):
     to say "this looks like a flexing/mobile organism, not a static one" -
     requires n_reseeds==0 (the one real false-positive case found during
     validation, a messy Chilodonella video reading 4.113, needed 4 reseeds
-    and should never have been trusted) as well as clearing
-    SHAPE_PROMOTE_MOBILE_THRESHOLD."""
+    and should never have been trusted), the seed region having enough real
+    texture to track reliably at all (added after proving a smooth artifact
+    like an air bubble can read a high, misleadingly "mobile-looking"
+    aspect-ratio value too - see MIN_TEXTURE_VARIANCE's docstring), as well
+    as clearing SHAPE_PROMOTE_MOBILE_THRESHOLD."""
     return (
         stats is not None
         and stats["n_reseeds"] == 0
+        and not stats.get("insufficient_texture", False)
         and stats["aspect_ratio_range"] >= SHAPE_PROMOTE_MOBILE_THRESHOLD
     )
 
@@ -280,6 +333,7 @@ def shape_signal_supports_static(stats):
     return (
         stats is not None
         and stats["n_reseeds"] == 0
+        and not stats.get("insufficient_texture", False)
         and stats["aspect_ratio_range"] <= SHAPE_DEMOTE_STATIC_THRESHOLD
     )
 
@@ -300,22 +354,28 @@ MOVEMENT_REAL_THRESHOLD_BL = 1.0
 
 def shows_no_real_movement(stats):
     """True when the tracked centroid barely moved and the track is
-    trustworthy (n_reseeds==0) - consistent with a static artifact (an air
+    trustworthy (n_reseeds==0, and the seed region had enough real texture
+    to track reliably in the first place - see MIN_TEXTURE_VARIANCE's
+    docstring for why that check matters: a smooth artifact like an air
+    bubble can "track" just fine by point-count alone while actually
+    sliding off its own edge) - consistent with a static artifact (an air
     bubble, debris) rather than a living, moving organism."""
     return (
         stats is not None
         and stats["n_reseeds"] == 0
+        and not stats.get("insufficient_texture", False)
         and stats["path_length_bl"] < MOVEMENT_STATIC_THRESHOLD_BL
     )
 
 
 def shows_clear_real_movement(stats):
     """True when the tracked centroid travelled a real distance and the
-    track is trustworthy (n_reseeds==0) - consistent with a genuinely
-    moving, living organism (gliding, spinning in place with some drift,
-    etc.) rather than a static artifact."""
+    track is trustworthy (n_reseeds==0, seed region had enough real texture)
+    - consistent with a genuinely moving, living organism (gliding, spinning
+    in place with some drift, etc.) rather than a static artifact."""
     return (
         stats is not None
         and stats["n_reseeds"] == 0
+        and not stats.get("insufficient_texture", False)
         and stats["path_length_bl"] >= MOVEMENT_REAL_THRESHOLD_BL
     )
