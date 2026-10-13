@@ -14,7 +14,7 @@ import anthropic
 from motion_costia import find_costia_detection
 from motion_shape_check import (
     check_shape_group, shape_signal_supports_mobile, shape_signal_supports_static,
-    shows_no_real_movement,
+    shows_clear_real_movement,
     STATIC_GROUP, MOBILE_GROUP, SHAPE_PROMOTED_FIXED_CONFIDENCE,
 )
 
@@ -853,27 +853,26 @@ async def analyze_video(file: UploadFile = File(...)):
                         primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
                         shape_check_applied = True
 
-            # PROTOTYPE, LOG-ONLY (2026-10-13): translational-movement
-            # corroboration, built same day after Adam pointed out the
-            # shape-only signal (which only measures whether an organism's
-            # OUTLINE flexes) couldn't have caught a real miss: an air bubble
-            # out-ranked a genuinely moving Chilodonella on Roboflow's own
-            # frame-count, and every candidate failed its visual check. The
-            # shape/group check above can't help there either - all 3
-            # candidates were in the SAME movement group, so it never ran.
+            # PROTOTYPE (2026-10-13): translational-movement corroboration,
+            # built same day after Adam pointed out the shape-only signal
+            # (which only measures whether an organism's OUTLINE flexes)
+            # couldn't have caught a real miss: an air bubble out-ranked a
+            # genuinely moving Chilodonella on Roboflow's own frame-count,
+            # and every candidate failed its visual check. The shape/group
+            # check above can't help there either - all 3 candidates were in
+            # the SAME movement group, so it never ran.
             #
-            # Downgraded from "lets it promote" back to log-only the SAME day,
-            # after real testing found the underlying path_length_bl number
-            # itself isn't reliable yet: a visually-confirmed STATIC air
-            # bubble read as moving 5-19 body-lengths across three separate
-            # real tests, including after removing an initial hypothesis
-            # (camera-motion/pan) that turned out not to be the explanation -
-            # see check_shape_group's docstring in motion_shape_check.py for
-            # the full investigation. Computing and logging this is still
-            # valuable (exactly the real-production-data-gathering step that
-            # earned the shape signal the right to act, before it got there)
-            # but it must not change what's shown until the measurement
-            # itself is actually trustworthy.
+            # Was downgraded to log-only the same day after real testing found
+            # path_length_bl unreliable (a static bubble read as moving 5-19
+            # body-lengths), then re-enabled once the real cause was found and
+            # fixed: a smooth, low-texture object's tracked points silently
+            # drift off it (the aperture problem), which the new texture gate
+            # in shows_no_real_movement/shows_clear_real_movement now catches
+            # before trusting any reading - see motion_shape_check.py's
+            # MIN_TEXTURE_VARIANCE docstring for the full investigation and
+            # real numbers behind it. Per Adam: since he's currently the only
+            # user, there's no real-world risk in letting this act again now
+            # rather than waiting on more log-only examples first.
             if all_candidates_rejected and not shape_check_applied:
                 try:
                     primary_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, primary)
@@ -881,8 +880,17 @@ async def analyze_video(file: UploadFile = File(...)):
                     primary_movement = None
                     print(f"Movement-corroboration check failed (non-fatal): {e}")
                 if primary_movement:
-                    print(f"Movement-check (log-only) for primary={primary['class']}: {primary_movement}")
-                    if shows_no_real_movement(primary_movement):
+                    print(f"Movement-check for primary={primary['class']}: {primary_movement}")
+                    # NOT shows_clear_real_movement, not shows_no_real_movement: the real
+                    # case this was built for (a smooth air bubble mislabeled as a static-
+                    # group species) reads as insufficient_texture, not confidently static -
+                    # shows_no_real_movement requires CONFIDENCE it's static, which an
+                    # untrustworthy reading can never provide. What actually matters here is
+                    # just that the primary ISN'T confidently showing real movement itself,
+                    # whatever the reason - confidently static, or unreliable/untextured -
+                    # while a specific alternative candidate IS confidently moving.
+                    if not shows_clear_real_movement(primary_movement):
+                        moving_cands = []
                         for cand in detections[1:]:
                             try:
                                 cand_movement = check_shape_group(tmp_path, fps, TARGET_SIZE, cand)
@@ -890,7 +898,20 @@ async def analyze_video(file: UploadFile = File(...)):
                                 cand_movement = None
                                 print(f"Movement-corroboration check failed for {cand['class']} (non-fatal): {e}")
                             if cand_movement:
-                                print(f"Movement-check (log-only) for {cand['class']}: {cand_movement}")
+                                print(f"Movement-check for {cand['class']}: {cand_movement}")
+                                if shows_clear_real_movement(cand_movement):
+                                    moving_cands.append((cand, cand_movement))
+                        if len(moving_cands) == 1:
+                            alt_cand, alt_movement = moving_cands[0]
+                            reasoning = (
+                                f"Movement tracking found {primary['class']} essentially static "
+                                f"(path_length={primary_movement['path_length_bl']} body-lengths) while "
+                                f"{alt_cand['class']} showed clear real movement "
+                                f"(path_length={alt_movement['path_length_bl']} body-lengths) - more "
+                                f"consistent with {alt_cand['class']} being the actual living organism, "
+                                f"especially since every candidate here failed its own visual check."
+                            )
+                            primary = _apply_shape_promotion(detections, primary, alt_cand, reasoning, alt_movement)
 
         # Quality check: use the best detection frame, or a middle frame if nothing was found
         quality = None
