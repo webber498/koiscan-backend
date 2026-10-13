@@ -63,6 +63,25 @@ MOBILE_GROUP = {"Gill Flukes", "Skin Fluke"}
 # static reading seen).
 SHAPE_PROMOTE_MOBILE_THRESHOLD = 0.35
 
+# Phase 3 (2026-10-13): fixed, deliberately capped confidence shown for a
+# shape-promoted result, used IN PLACE OF Roboflow's own raw score for that
+# detection. Found testing this today: Roboflow's real score for the
+# promoted candidate can be low (it's whatever that single sampled frame
+# scored, often low precisely because the organism looked ambiguous there -
+# the same reason it needed promoting in the first place), which looked
+# wrong and undermined trust next to the demoted candidate's own higher
+# score, even once the duplicate was correctly hidden. Rather than compute
+# some blended number from Roboflow's score and the shape signal - neither
+# one is calibrated as a real probability, so combining them would just be
+# false precision - this mirrors the same principle already used for Costia
+# (COSTIA_FIXED_CONFIDENCE in motion_costia.py): a flat, honest number in
+# the "Medium" tier (ResultView.tsx: >=0.8 High, >=0.5 Medium, else Low).
+# Set a little above Costia's 0.55: unlike Costia, Roboflow DID genuinely
+# detect this organism on real pixels, just with a low score on that one
+# frame - the shape signal adds real corroboration on top of a real
+# detection, not instead of one.
+SHAPE_PROMOTED_FIXED_CONFIDENCE = 0.6
+
 TRACK_SECONDS = 10
 MAX_CORNERS = 30
 MIN_POINTS_TO_RESEED = 8

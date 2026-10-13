@@ -12,7 +12,10 @@ import re
 import anthropic
 
 from motion_costia import find_costia_detection
-from motion_shape_check import check_shape_group, shape_signal_supports_mobile, STATIC_GROUP, MOBILE_GROUP
+from motion_shape_check import (
+    check_shape_group, shape_signal_supports_mobile,
+    STATIC_GROUP, MOBILE_GROUP, SHAPE_PROMOTED_FIXED_CONFIDENCE,
+)
 
 app = FastAPI()
 
@@ -772,6 +775,14 @@ async def analyze_video(file: UploadFile = File(...)):
                         if mobile_cand:
                             old_primary = primary
                             mobile_cand["shape_promoted"] = True
+                            # Keep the raw Roboflow score around for logs/debugging, but
+                            # show a fixed, honest Medium-tier number instead of it (see
+                            # SHAPE_PROMOTED_FIXED_CONFIDENCE's docstring for why) - the
+                            # real per-frame score here can be low precisely because the
+                            # organism looked ambiguous on that frame, which looked wrong
+                            # sitting next to the demoted candidate's higher score.
+                            mobile_cand["roboflow_confidence"] = mobile_cand["confidence"]
+                            mobile_cand["confidence"] = SHAPE_PROMOTED_FIXED_CONFIDENCE
                             mobile_cand["shape_promotion_reasoning"] = (
                                 f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
                                 f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
