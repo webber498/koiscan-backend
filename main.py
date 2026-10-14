@@ -23,6 +23,22 @@ from motion_shape_check import (
 # is already confirmed to be alive and moving (see check_movement_plausibility's
 # "movement_pattern" field). Nothing established yet for White Spot, so it's
 # deliberately left out rather than guessed.
+# Evidence guard (2026-10-14). A labelled-library batch (36 videos) showed plain
+# frame-frequency ranking (Roboflow's multi-frame vote) is right 94% of the
+# time, while the corrective logic layered on top of it - one-off vision/shape/
+# plausibility verdicts - was net NEGATIVE (helped 1, hurt 5): a 1-7 frame
+# candidate kept overriding a 29-233 frame primary on a single noisy verdict.
+# These set how much of the primary's frame support a candidate must have
+# before such a verdict may override it (candidate_frames >= ratio * primary_frames).
+# Tuned against that batch, not guessed - see _enough_frame_evidence.
+OVERRIDE_MIN_FRAME_RATIO = 0.5
+PLAUSIBILITY_PROMOTE_MIN_FRAME_RATIO = 0.5
+
+
+def _enough_frame_evidence(primary, cand, ratio):
+    return (cand.get("frame_count", 0) or 0) >= ratio * (primary.get("frame_count", 0) or 0)
+
+
 EXPECTED_MOVEMENT_PATTERN = {
     "Trichodina": "spinning_in_place",
     "Chilodonella": "translating_across_frame",
@@ -85,7 +101,7 @@ LABEL_PLAUSIBILITY_INSTRUCTIONS = """These are cropped image(s) from a koi mucus
 
 Look closely at the actual visible detail inside the organism, not just its outline shape. Does the internal structure genuinely look consistent with that parasite, or does it look more like something else — for example a free-living ciliate/protozoan (like a Paramecium), debris, an air bubble, or another artefact? An elongated or fluke-like outline alone is not enough to confirm a fluke-type parasite; internal detail matters more than silhouette.
 
-Air bubbles are a common false positive in wet-mount microscopy and can visually resemble round parasites like Trichodina at a glance. Look for the tell-tale signs of a bubble specifically: a smooth, sharply-defined circular or oval edge, often with a bright specular highlight or a uniform halo/ring, and little or no genuine internal granular texture or visible organelles. If multiple images are shown and the object looks essentially static and unchanged between them - no real internal detail, no structural variation - treat that absence of any organism-like detail as evidence against it being a living parasite, not as a neutral or inconclusive result.
+Air bubbles are a common false positive in wet-mount microscopy, but only call something an air bubble if you can positively SEE bubble signs: a perfectly circular, transparent, sharply outlined ring with a bright specular highlight and a clear, empty interior. A dark, pigmented, blurry or irregularly shaped body is NOT a bubble just because its internal detail is hard to resolve - blur and low resolution are normal in these videos and must never count against an organism. Whenever you cannot clearly see bubble signs or clearly contradicting anatomy, answer label_plausible=true.
 
 If multiple images are shown, also weigh how the organism's shape changes between them - visible stretching and compressing over time is consistent with a real fluke-type parasite's natural movement, not evidence against it, even if any single frame alone looks rounder or more ambiguous.
 
@@ -915,6 +931,11 @@ async def analyze_video(file: UploadFile = File(...)):
                 cand["label_plausible"] = plausibility["label_plausible"]
                 cand["label_plausibility_reasoning"] = plausibility["reasoning"]
                 if plausibility["label_plausible"]:
+                    if cand is not detections[0] and not _enough_frame_evidence(
+                            detections[0], cand, PLAUSIBILITY_PROMOTE_MIN_FRAME_RATIO):
+                        print(f"Not promoting {cand['class']} on plausibility alone: only "
+                              f"{cand.get('frame_count')} frames vs {detections[0].get('frame_count')} for {detections[0]['class']}")
+                        continue
                     chosen = cand
                     break
             # True only when every candidate was actually, successfully checked
@@ -1009,9 +1030,16 @@ async def analyze_video(file: UploadFile = File(...)):
                     if (primary["class"] in STATIC_GROUP and len(mobile_classes_present) == 1
                             and shape_signal_supports_mobile(shape_stats)):
                         mobile_cand = next(d for d in detections[1:] if d["class"] in MOBILE_GROUP)
-                        deformation = _vision_body_deformation(tmp_path, fps, TARGET_SIZE, primary)
-                        print(f"Body-deformation check for primary={primary['class']}: {deformation}")
-                        if deformation == "rigid_body":
+                        if not _enough_frame_evidence(primary, mobile_cand, OVERRIDE_MIN_FRAME_RATIO):
+                            deformation = "blocked"
+                            print(f"Shape promotion to {mobile_cand['class']} blocked - only {mobile_cand.get('frame_count')} "
+                                  f"frames vs {primary.get('frame_count')} for {primary['class']}")
+                        else:
+                            deformation = _vision_body_deformation(tmp_path, fps, TARGET_SIZE, primary)
+                            print(f"Body-deformation check for primary={primary['class']}: {deformation}")
+                        if deformation == "blocked":
+                            pass
+                        elif deformation == "rigid_body":
                             # Veto only: a rigid body that tumbles/rotates shows a changing
                             # outline too, so a high aspect-ratio range alone isn't proof of
                             # flexing. Leave the primary alone.
@@ -1028,9 +1056,16 @@ async def analyze_video(file: UploadFile = File(...)):
                           and len(static_classes_present) == 1
                           and shape_signal_supports_static(shape_stats)):
                         static_cand = next(d for d in detections[1:] if d["class"] in STATIC_GROUP)
-                        deformation = _vision_body_deformation(tmp_path, fps, TARGET_SIZE, primary)
-                        print(f"Body-deformation check for primary={primary['class']}: {deformation}")
-                        if deformation == "flexing_body":
+                        if not _enough_frame_evidence(primary, static_cand, OVERRIDE_MIN_FRAME_RATIO):
+                            deformation = "blocked"
+                            print(f"Shape demotion to {static_cand['class']} blocked - only {static_cand.get('frame_count')} "
+                                  f"frames vs {primary.get('frame_count')} for {primary['class']}")
+                        else:
+                            deformation = _vision_body_deformation(tmp_path, fps, TARGET_SIZE, primary)
+                            print(f"Body-deformation check for primary={primary['class']}: {deformation}")
+                        if deformation == "blocked":
+                            pass
+                        elif deformation == "flexing_body":
                             print(f"Shape demotion to {static_cand['class']} vetoed - vision judges the body visibly flexing")
                         else:
                             reasoning = (
@@ -1132,6 +1167,9 @@ async def analyze_video(file: UploadFile = File(...)):
                                 )
                                 if contradicts_label:
                                     print(f"Not promoting {cand['class']}: its own body ({body}) contradicts that label")
+                                elif not _enough_frame_evidence(primary, cand, OVERRIDE_MIN_FRAME_RATIO):
+                                    print(f"Not promoting {cand['class']} on movement alone: only "
+                                          f"{cand.get('frame_count')} frames vs {primary.get('frame_count')} for {primary['class']}")
                                 elif cand_motion["shows_organism_movement"]:
                                     moving_cands.append((cand, cand_motion))
                         if len(moving_cands) == 1:
@@ -1178,7 +1216,8 @@ async def analyze_video(file: UploadFile = File(...)):
                                 if cand_motion:
                                     print(f"Movement-visual-check for {cand['class']}: {cand_motion}")
                                     if (cand_motion["shows_organism_movement"]
-                                            and cand_motion.get("movement_pattern") == observed_pattern):
+                                            and cand_motion.get("movement_pattern") == observed_pattern
+                                            and _enough_frame_evidence(primary, cand, OVERRIDE_MIN_FRAME_RATIO)):
                                         pattern_matched_cands.append((cand, cand_motion))
                             if len(pattern_matched_cands) == 1:
                                 alt_cand, alt_motion = pattern_matched_cands[0]
