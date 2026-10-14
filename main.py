@@ -392,7 +392,18 @@ def _extract_movement_burst(video_path: str, fps: float, target_size: int, detec
 
     seed_frame = int(round(detection["timestamp"] * fps)) if fps else 0
     total_span_frames = max(1, int(fps * duration_seconds)) if fps else num_frames
-    step = max(1, total_span_frames // num_frames)
+    # Found in real production logs 2026-10-14: most test clips are only 6-19s
+    # long, so a 25s window starting at the candidate's own timestamp ran off
+    # the end of the video - some scans got only 4 frames, others fewer than the
+    # 3-frame minimum and silently skipped the check entirely. Clamp the window
+    # to fit inside the video: shrink it to the video's real length if needed,
+    # and shift the start earlier (not just truncate) so the full available
+    # span is still used.
+    video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if video_frames > 0:
+        total_span_frames = min(total_span_frames, video_frames - 1)
+        seed_frame = max(0, min(seed_frame, video_frames - 1 - total_span_frames))
+    step = max(1, total_span_frames // max(1, num_frames - 1))
 
     crops_b64, timestamps = [], []
     for i in range(num_frames):
