@@ -361,8 +361,10 @@ Weigh relative position (compared to fixed background features, not the frame ed
 
 If it does show real movement, also judge the CHARACTER of that movement: does it mostly spin, rotate, or vibrate around a roughly fixed spot without actually travelling far (like a top spinning in place)? Or does it clearly glide/crawl/travel a real distance across the visible field over time, ending up near different background features than it started near? If it shows no real movement, or the pattern genuinely isn't clear either way, say so honestly rather than guessing.
 
+Separately, judge the organism's BODY behaviour. Does the body itself genuinely bend, stretch, curl or compress in a flexible, worm-like way (the shape deforms)? Or does it act like a rigid body - keeping the same basic shape and only APPEARING to change outline because it rotates or tumbles to show a different side? Be careful: a flat, leaf-shaped cell turning edge-on versus face-on looks elongated in one frame and round in the next, but that is rotation of a rigid body, not flexing. Only say it is flexing if the body's own shape visibly deforms (bends, curls, stretches along its length) between frames.
+
 Respond with ONLY a JSON object, no other text and no markdown fences:
-{{"shows_organism_movement": true/false, "movement_pattern": "spinning_in_place"/"translating_across_frame"/"unclear", "reasoning": "one short sentence describing what you actually observe changing (or not) across the sequence, relative to the background"}}"""
+{{"shows_organism_movement": true/false, "movement_pattern": "spinning_in_place"/"translating_across_frame"/"unclear", "body_deformation": "flexing_body"/"rigid_body"/"unclear", "reasoning": "one short sentence describing what you actually observe changing (or not) across the sequence, relative to the background"}}"""
 
 
 def _extract_movement_burst(video_path: str, fps: float, target_size: int, detection: dict,
@@ -484,6 +486,9 @@ def check_movement_plausibility(video_path: str, fps: float, target_size: int, d
             "shows_organism_movement": bool(result.get("shows_organism_movement", False)),
             "movement_pattern": movement_pattern if movement_pattern in (
                 "spinning_in_place", "translating_across_frame", "unclear"
+            ) else "unclear",
+            "body_deformation": result.get("body_deformation") if result.get("body_deformation") in (
+                "flexing_body", "rigid_body", "unclear"
             ) else "unclear",
             "reasoning": str(result.get("reasoning", ""))[:400],
         }
@@ -621,6 +626,26 @@ def _call_roboflow(frame_count: int, img_base64: str):
         return frame_count, img_base64, None, "timed out"
     except requests.exceptions.RequestException as e:
         return frame_count, img_base64, None, str(e)
+
+
+def _vision_body_deformation(video_path, fps, target_size, detection):
+    """Asks the vision movement check one narrow question about the candidate's
+    own body: does it flex (bend/curl/stretch, a fluke-like behaviour) or is it a
+    rigid body that only looks like it changes shape by rotating? Returns
+    "flexing_body", "rigid_body", "unclear", or None if the check couldn't run.
+    Built after a real production miss (2026-10-14): a flat, leaf-shaped
+    Chilodonella tumbling edge-on/face-on read aspect_ratio_range=3.69 on a
+    clean track and was promoted to Skin Fluke - the shape signal measures
+    outline change but can't tell non-rigid flexing from rigid rotation."""
+    try:
+        m = check_movement_plausibility(
+            video_path, fps, target_size, detection,
+            duration_seconds=25.0, num_frames=12, padding_factor=4.0,
+        )
+    except Exception as e:
+        print(f"Body-deformation check failed (non-fatal): {e}")
+        return None
+    return m.get("body_deformation") if m else None
 
 
 def _apply_shape_promotion(detections, old_primary, new_primary, reasoning, shape_stats):
@@ -984,24 +1009,37 @@ async def analyze_video(file: UploadFile = File(...)):
                     if (primary["class"] in STATIC_GROUP and len(mobile_classes_present) == 1
                             and shape_signal_supports_mobile(shape_stats)):
                         mobile_cand = next(d for d in detections[1:] if d["class"] in MOBILE_GROUP)
-                        reasoning = (
-                            f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
-                            f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
-                            f"organism, not the static reading expected for {primary['class']}."
-                        )
-                        primary = _apply_shape_promotion(detections, primary, mobile_cand, reasoning, shape_stats)
-                        shape_check_applied = True
+                        deformation = _vision_body_deformation(tmp_path, fps, TARGET_SIZE, primary)
+                        print(f"Body-deformation check for primary={primary['class']}: {deformation}")
+                        if deformation == "rigid_body":
+                            # Veto only: a rigid body that tumbles/rotates shows a changing
+                            # outline too, so a high aspect-ratio range alone isn't proof of
+                            # flexing. Leave the primary alone.
+                            print(f"Shape promotion to {mobile_cand['class']} vetoed - vision judges the body rigid (rotating), not flexing")
+                        else:
+                            reasoning = (
+                                f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
+                                f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a flexing/mobile "
+                                f"organism, not the static reading expected for {primary['class']}."
+                            )
+                            primary = _apply_shape_promotion(detections, primary, mobile_cand, reasoning, shape_stats)
+                            shape_check_applied = True
                     elif (primary["class"] in MOBILE_GROUP and primary.get("label_plausible") is False
                           and len(static_classes_present) == 1
                           and shape_signal_supports_static(shape_stats)):
                         static_cand = next(d for d in detections[1:] if d["class"] in STATIC_GROUP)
-                        reasoning = (
-                            f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
-                            f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a static/round "
-                            f"organism, and {primary['class']} already failed its own label-plausibility check."
-                        )
-                        primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
-                        shape_check_applied = True
+                        deformation = _vision_body_deformation(tmp_path, fps, TARGET_SIZE, primary)
+                        print(f"Body-deformation check for primary={primary['class']}: {deformation}")
+                        if deformation == "flexing_body":
+                            print(f"Shape demotion to {static_cand['class']} vetoed - vision judges the body visibly flexing")
+                        else:
+                            reasoning = (
+                                f"Movement tracking found aspect_ratio_range={shape_stats['aspect_ratio_range']} "
+                                f"(n_reseeds={shape_stats['n_reseeds']}) - strongly consistent with a static/round "
+                                f"organism, and {primary['class']} already failed its own label-plausibility check."
+                            )
+                            primary = _apply_shape_promotion(detections, primary, static_cand, reasoning, shape_stats)
+                            shape_check_applied = True
 
             # PROTOTYPE (2026-10-13): movement corroboration via Claude's own
             # vision, not point-tracking math. Built same day after a real,
