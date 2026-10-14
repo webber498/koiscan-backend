@@ -1089,6 +1089,25 @@ async def analyze_video(file: UploadFile = File(...)):
                     print(f"Movement-visual-plausibility check failed (non-fatal): {e}")
                 if primary_motion:
                     print(f"Movement-visual-check for primary={primary['class']}: {primary_motion}")
+                    # Real production flip-flop 2026-10-14: the SAME clip with the SAME
+                    # seed (timestamp/x/y identical) got "moving" on one scan and "not
+                    # moving" on the next - ordinary run-to-run variance in the vision
+                    # model. A single "static" verdict is too noisy to act on, so confirm
+                    # it with a second independent run first; if the two disagree, treat
+                    # the primary as possibly-moving and leave it alone.
+                    if not primary_motion["shows_organism_movement"]:
+                        try:
+                            recheck = check_movement_plausibility(
+                                tmp_path, fps, TARGET_SIZE, primary,
+                                duration_seconds=25.0, num_frames=12, padding_factor=4.0,
+                            )
+                        except Exception as e:
+                            recheck = None
+                            print(f"Movement recheck failed (non-fatal): {e}")
+                        print(f"Movement-visual-recheck for primary={primary['class']}: {recheck}")
+                        if recheck is None or recheck["shows_organism_movement"]:
+                            primary_motion = dict(primary_motion, shows_organism_movement=True)
+                            print("Primary 'static' verdict not confirmed on recheck - leaving it in place")
                     if not primary_motion["shows_organism_movement"]:
                         moving_cands = []
                         for cand in detections[1:]:
@@ -1102,7 +1121,18 @@ async def analyze_video(file: UploadFile = File(...)):
                                 print(f"Movement-visual-plausibility check failed for {cand['class']} (non-fatal): {e}")
                             if cand_motion:
                                 print(f"Movement-visual-check for {cand['class']}: {cand_motion}")
-                                if cand_motion["shows_organism_movement"]:
+                                # Same rigid-vs-flexing sanity check as the shape promotion:
+                                # a candidate labelled as a fluke whose own body is judged
+                                # rigid (production case: a tumbling Chilodonella, Skin Fluke
+                                # label, "rotates but does not flex") contradicts its label.
+                                body = cand_motion.get("body_deformation")
+                                contradicts_label = (
+                                    (cand["class"] in MOBILE_GROUP and body == "rigid_body")
+                                    or (cand["class"] in STATIC_GROUP and body == "flexing_body")
+                                )
+                                if contradicts_label:
+                                    print(f"Not promoting {cand['class']}: its own body ({body}) contradicts that label")
+                                elif cand_motion["shows_organism_movement"]:
                                     moving_cands.append((cand, cand_motion))
                         if len(moving_cands) == 1:
                             alt_cand, alt_motion = moving_cands[0]
